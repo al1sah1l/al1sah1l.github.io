@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pink Messages</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <!-- Login: shown until Graffiti session exists -->
+    <div id="login-screen" class="screen">
+      <div class="login-card card">
+        <h1 class="app-title">Pink Messages</h1>
+        <p class="login-blurb">
+          A tiny pastel chat space powered by Graffiti. Log in to create chats,
+          send messages, and keep personal highlights in one place.
+        </p>
+        <button type="button" id="btn-login" class="btn btn-primary">
+          Log in with Graffiti
+        </button>
+        <p id="login-status" class="inline-status" aria-live="polite"></p>
+      </div>
+    </div>
+
+    <!-- Main app -->
+    <div id="app-screen" class="screen hidden" hidden>
+      <header class="top-header">
+        <div class="header-left">
+          <span class="logo-dot" aria-hidden="true"></span>
+          <h1 class="header-title">Pink Messages</h1>
+        </div>
+        <div class="header-right">
+          <span id="user-handle" class="user-handle"></span>
+          <button type="button" id="btn-logout" class="btn btn-ghost">
+            Log out
+          </button>
+        </div>
+      </header>
+
+      <nav class="tab-bar" role="tablist" aria-label="Main">
+        <button
+          type="button"
+          class="tab active"
+          role="tab"
+          id="tab-chats"
+          aria-selected="true"
+          data-tab="chats"
+        >
+          Chats
+        </button>
+        <button
+          type="button"
+          class="tab"
+          role="tab"
+          id="tab-important"
+          aria-selected="false"
+          data-tab="important"
+        >
+          Important
+        </button>
+      </nav>
+
+      <p id="global-status" class="global-status" aria-live="polite"></p>
+
+      <div class="app-layout">
+        <!-- Chats: sidebar + main -->
+        <div id="chats-layout" class="chats-layout">
+          <aside class="sidebar card">
+            <div class="sidebar-section">
+              <div class="section-label">Folders</div>
+              <div id="folder-pills" class="folder-pills" role="tablist" aria-label="Folders">
+                <button type="button" class="folder-pill active" data-folder="All">All</button>
+                <button type="button" class="folder-pill" data-folder="People">People</button>
+                <button type="button" class="folder-pill" data-folder="Groups">Groups</button>
+                <button type="button" class="folder-pill" data-folder="Verification">Verification</button>
+              </div>
+            </div>
+
+            <div class="sidebar-actions">
+              <button type="button" id="btn-new-chat" class="btn btn-primary btn-block">
+                New Chat
+              </button>
+              <button type="button" id="btn-toggle-discover" class="btn btn-secondary btn-block">
+                Discover Chats
+              </button>
+            </div>
+
+            <div id="discover-panel" class="discover-panel hidden" hidden>
+              <div class="section-label">Available to join</div>
+              <p id="discover-status" class="inline-status"></p>
+              <ul id="discover-list" class="discover-list"></ul>
+            </div>
+
+            <div class="sidebar-section flex-grow">
+              <div class="section-label">Your chats</div>
+              <p id="chat-list-status" class="inline-status"></p>
+              <ul id="chat-list" class="chat-list"></ul>
+            </div>
+          </aside>
+
+          <main class="main-panel card">
+            <div id="chat-placeholder" class="placeholder">
+              <p>Select a chat or create a new one.</p>
+            </div>
+
+            <div id="chat-view" class="chat-view hidden" hidden>
+              <div class="chat-header">
+                <h2 id="chat-title" class="chat-title"></h2>
+                <span id="chat-folder-badge" class="folder-badge"></span>
+              </div>
+              <div id="messages-area" class="messages-area"></div>
+              <p id="chat-error" class="error-msg" role="alert"></p>
+              <form id="send-form" class="composer">
+                <label class="sr-only" for="message-input">Message</label>
+                <textarea
+                  id="message-input"
+                  class="message-input"
+                  rows="2"
+                  placeholder="Type a message…"
+                  maxlength="4000"
+                ></textarea>
+                <button type="submit" id="btn-send" class="btn btn-primary">
+                  Send
+                </button>
+              </form>
+            </div>
+          </main>
+        </div>
+
+        <!-- Important tab -->
+        <div id="important-layout" class="important-layout hidden" hidden>
+          <section class="important-panel card">
+            <h2 class="important-heading">Saved for you</h2>
+            <p class="important-sub">Messages you marked with the star (just for your account).</p>
+            <p id="important-status" class="inline-status"></p>
+            <ul id="important-list" class="important-list"></ul>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <!-- New chat modal -->
+    <div id="modal-new-chat" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-new-title" hidden>
+      <div class="modal-backdrop" data-close-modal></div>
+      <div class="modal-content card">
+        <h2 id="modal-new-title">New chat</h2>
+        <form id="form-new-chat">
+          <label>
+            Title
+            <input type="text" id="new-chat-title" required maxlength="120" placeholder="e.g. Study group" />
+          </label>
+          <label>
+            Folder
+            <select id="new-chat-folder" required>
+              <option value="People">People</option>
+              <option value="Groups">Groups</option>
+              <option value="Verification">Verification</option>
+            </select>
+          </label>
+          <p id="new-chat-status" class="inline-status"></p>
+          <p id="new-chat-error" class="error-msg" role="alert"></p>
+          <div class="modal-actions">
+            <button type="button" class="btn btn-ghost" data-close-modal>Cancel</button>
+            <button type="submit" id="btn-create-chat" class="btn btn-primary">Create</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <script type="module" src="index.js"></script>
+  </body>
+</html>
