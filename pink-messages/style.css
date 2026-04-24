@@ -22,12 +22,26 @@
   box-sizing: border-box;
 }
 
+html,
 body {
+  height: 100%;
   margin: 0;
-  min-height: 100vh;
+}
+
+body {
+  min-height: 100%;
+  min-height: 100dvh;
   font-family: var(--font);
   color: var(--text);
   background: linear-gradient(160deg, var(--bg) 0%, var(--bg-deep) 45%, #fff 100%);
+}
+
+/* Mount point fills the window so every flex:1 child can get real space */
+#app {
+  height: 100%;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
 }
 
 .hidden,
@@ -78,11 +92,23 @@ body {
   font-size: 0.95rem;
 }
 
-/* App shell */
+/* Vue Root wrapper: stretch logged-in content to the bottom of the viewport */
+.app-root {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+
+/* App shell: header + status + app-layout; also overrides .screen so this can flex, not only min(100vh) from content */
 #app-screen {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  flex: 1 1 0;
+  min-height: 0; /* must beat .screen or the shell never shrinks in the flex parent */
+  height: 100%;
+  max-height: 100%;
 }
 
 .top-header {
@@ -114,6 +140,17 @@ body {
   font-size: 1.15rem;
   font-weight: 600;
   color: #86198f;
+}
+
+/* Hash router: title + nav look like the old app but with <a> + active rules */
+a.header-link {
+  text-decoration: none;
+  color: inherit;
+}
+
+a.header-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .header-right {
@@ -153,13 +190,22 @@ body {
   background: rgba(255, 255, 255, 0.6);
 }
 
-.tab.active {
+.tab.active,
+.tab.router-link-active,
+.tab.router-link-exact-active {
   color: #86198f;
   font-weight: 600;
   background: var(--card);
   border-color: var(--line);
   border-bottom-color: var(--card);
   margin-bottom: -1px;
+}
+
+a.tab {
+  text-decoration: none;
+  display: inline-block;
+  box-sizing: border-box;
+  color: inherit; /* so .tab + router-link do not get default link purple */
 }
 
 .global-status {
@@ -171,11 +217,11 @@ body {
 }
 
 .app-layout {
-  flex: 1;
+  flex: 1 1 0;
+  min-height: 0;
   padding: 0 1rem 1rem;
   display: flex;
   flex-direction: column;
-  min-height: 0;
 }
 
 .card {
@@ -187,12 +233,16 @@ body {
   padding-top: 20px;
 }
 
+/* Fills the window below the header/tabs (independent of how many chat rows in the sidebar) */
 .chats-layout {
   display: grid;
   grid-template-columns: minmax(240px, 300px) 1fr;
+  grid-template-rows: 1fr;
+  flex: 1 1 0;
+  min-height: 0;
   gap: 1rem;
-  flex: 1;
-  min-height: 420px;
+  align-items: stretch;
+  align-content: stretch;
 }
 
 .sidebar {
@@ -201,6 +251,9 @@ body {
   padding: 1rem;
   gap: 1rem;
   min-height: 0;
+  height: 100%;
+  max-height: 100%;
+  overflow: hidden;
 }
 
 .sidebar-section.flex-grow {
@@ -322,6 +375,12 @@ body {
   margin-bottom: 0.35rem;
 }
 
+a.chat-item {
+  text-decoration: none;
+  color: inherit;
+  box-sizing: border-box;
+}
+
 .chat-item {
   width: 100%;
   text-align: left;
@@ -376,10 +435,13 @@ body {
   font-size: 0.8rem;
 }
 
-.main-panel {
+/* Second column: fill grid row so chat can pin the composer to the bottom */
+main.main-panel {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  height: 100%;
+  max-height: 100%;
   padding: 0;
   overflow: hidden;
 }
@@ -393,11 +455,19 @@ body {
   padding: 2rem;
 }
 
-.chat-view {
-  flex: 1;
+/* Outermost wrapper for chat route: grow inside main and stack header / thread / input */
+.chat-wrap {
+  flex: 1 1 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
+}
+
+.chat-view {
+  flex: 1 1 0;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .chat-header {
@@ -422,7 +492,8 @@ body {
 }
 
 .messages-area {
-  flex: 1;
+  flex: 1 1 0;
+  min-height: 0;
   overflow-y: auto;
   padding: 1rem;
   display: flex;
@@ -470,8 +541,130 @@ body {
   margin-bottom: 0.25rem;
   display: flex;
   align-items: center;
-  gap: 0.35rem;
+  gap: 0.4rem;
   flex-wrap: wrap;
+  cursor: pointer;
+}
+
+.avatar-wrap {
+  flex: 0 0 auto;
+}
+
+.msg-avatar {
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 50%;
+  object-fit: cover;
+  display: block;
+  border: 1px solid var(--line);
+}
+
+.msg-avatar.ph {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.65rem;
+  font-weight: 600;
+  background: var(--bg-deep);
+  color: #86198f;
+}
+
+.sender-line {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.sender-name-btn {
+  border: none;
+  background: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: #86198f;
+  cursor: pointer;
+  text-align: left;
+  max-width: 10rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sender-name-btn:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.msg-body-line {
+  font-size: 0.92rem;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+/* Public profile (route /profile/:id) */
+.profile-hero {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 0.25rem;
+}
+
+.profile-avatar {
+  width: 3.4rem;
+  height: 3.4rem;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 2px solid var(--line);
+  flex: 0 0 auto;
+}
+
+.profile-avatar.ph {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: #86198f;
+  background: var(--bg-deep);
+}
+
+.profile-name {
+  margin: 0 0 0.25rem;
+  font-size: 1.35rem;
+  color: #4a1942;
+}
+
+.profile-actor {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.empty-profile {
+  color: var(--muted);
+  margin: 0.5rem 0 0;
+}
+
+/* Edit profile */
+.profile-edit label,
+.profile-edit .modal-content label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-bottom: 0.85rem;
+  font-size: 0.9rem;
+}
+
+.profile-edit input,
+.profile-page input {
+  padding: 0.45rem 0.6rem;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  font: inherit;
 }
 
 .msg-actions {
@@ -517,6 +710,8 @@ body {
 
 .composer {
   display: flex;
+  flex-shrink: 0;
+  margin-top: auto;
   gap: 0.5rem;
   padding: 0.75rem 1rem;
   border-top: 1px solid var(--line);
@@ -671,6 +866,8 @@ body {
 @media (max-width: 800px) {
   .chats-layout {
     grid-template-columns: 1fr;
+    /* sidebar chunk + main: main still takes all remaining height */
+    grid-template-rows: minmax(0, 320px) 1fr;
   }
 
   .sidebar {
