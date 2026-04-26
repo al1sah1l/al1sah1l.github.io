@@ -7,6 +7,7 @@ import { createApp, ref, reactive, provide, toRaw } from "vue";
 import { createRouter, createWebHashHistory } from "vue-router";
 import { GraffitiDecentralized } from "https://esm.sh/@graffiti-garden/implementation-decentralized@0.0.9";
 import { MessageBubble } from "./components/MessageBubble.js";
+import { GraffitiMediaImg } from "./components/GraffitiMediaImg.js";
 
 // --- one shared discovery name for the class, plus per-actor inboxes
 const DISCOVERY_CHANNEL = "pink-messages-2026";
@@ -36,11 +37,18 @@ function routeIdFromChannel(channel) {
   return channel.split("/").pop() || channel;
 }
 
-/** data URL (upload) or old photoURL from links */
-function profilePhotoSrc(p) {
-  if (!p) return null;
-  const s = p.photoData || p.photoURL;
-  return s && String(s).trim() ? s.trim() : null;
+/**
+ * Single string to feed GraffitiMediaImg (or save): Graffiti media URL from postMedia in photoUrl,
+ * legacy https in photoURL, or legacy inline data URL in photoData.
+ */
+function profileImageSrc(p) {
+  if (!p) return "";
+  const u = (p.photoUrl && String(p.photoUrl).trim()) || "";
+  if (u) return u;
+  const d = (p.photoData && String(p.photoData).trim()) || "";
+  if (d) return d;
+  const h = (p.photoURL && String(p.photoURL).trim()) || "";
+  return h;
 }
 
 /** public-facing name (username is the main handle when set) */
@@ -60,28 +68,32 @@ const profileIndexRows = ref([]);
  */
 async function postProfileIndexCard(sess, { actor, username, firstName, lastName, updated }) {
   if (!sess) return;
-  await graffiti.post(
-    {
-      channels: [PROFILE_INDEX_CHANNEL],
-      value: {
-        activity: "ProfileIndex",
-        type: "ProfileIndex",
-        actor,
-        username: String(username || "").replace(/^@/, "").trim().toLowerCase() || "unnamed",
-        firstName: firstName || "",
-        lastName: lastName || "",
-        updated: updated || Date.now(),
-      },
+  const raw = toRaw(sess);
+  const doc = {
+    channels: [PROFILE_INDEX_CHANNEL],
+    value: {
+      activity: "ProfileIndex",
+      type: "ProfileIndex",
+      actor,
+      username: String(username || "").replace(/^@/, "").trim().toLowerCase() || "unnamed",
+      firstName: firstName || "",
+      lastName: lastName || "",
+      updated: updated || Date.now(),
     },
-    sess
-  );
+  };
+  await graffiti.post(JSON.parse(JSON.stringify(doc)), raw);
 }
 
 /**
  * One place to save: personal SetProfile (full) + a tiny public index copy for search.
- * photoData is usually a data URL if the user used file upload; old saves may still have photoURL only.
+ * New photos: upload bytes with postMedia first, then store the returned URL in photoUrl (discoverable object stays small).
+ * We still accept legacy giant photoData (data URL) only when migrating old saves — prefer photoUrl.
  */
-async function saveFullProfile(sessionObj, { firstName, lastName, username, photoData }) {
+async function saveFullProfile(sessionObj, { firstName, lastName, username, photoUrl, photoData }) {
+  if (!sessionObj || !sessionObj.actor) {
+    throw new Error("Please log in again, then save your profile.");
+  }
+  const raw = toRaw(sessionObj);
   const t = String(username || "")
     .replace(/^@/, "")
     .trim()
@@ -93,20 +105,28 @@ async function saveFullProfile(sessionObj, { firstName, lastName, username, phot
   if (t && t.length < 2) {
     throw new Error("Username should be at least 2 characters.");
   }
+  const url = photoUrl != null && String(photoUrl).trim() ? String(photoUrl).trim() : null;
+  const data = photoData != null && String(photoData).trim() ? String(photoData).trim() : null;
   const up = {
     activity: "SetProfile",
     actor: sessionObj.actor,
     firstName: String(firstName || "").trim(),
     lastName: String(lastName || "").trim(),
     username: t || "user_" + sessionObj.actor.slice(0, 6),
-    photoData: photoData == null || photoData === "" ? null : String(photoData).trim() || null,
     updated: Date.now(),
   };
-  await graffiti.post(
-    { channels: [profileStorageChannel(sessionObj.actor)], value: up },
-    sessionObj
-  );
-  await postProfileIndexCard(sessionObj, {
+  // Latest SetProfile wins in loadProfileForActor (sort by updated). We do not deleteMedia on
+  // replaced icons — old profile revisions could still point at them; leaving orphans is OK for a class project.
+  if (url) {
+    up.photoUrl = url;
+  } else if (data && data.startsWith("data:")) {
+    up.photoData = data;
+  } else if (data) {
+    up.photoUrl = data;
+  }
+  const profileDoc = { channels: [profileStorageChannel(sessionObj.actor)], value: up };
+  await graffiti.post(JSON.parse(JSON.stringify(profileDoc)), raw);
+  await postProfileIndexCard(raw, {
     actor: sessionObj.actor,
     username: up.username,
     firstName: up.firstName,
@@ -265,6 +285,8 @@ const loginMsg = ref("");
 
 const chatRows = ref([]);
 const discoveredCreates = ref([]);
+const deletedChatChannels = ref(new Set());
+const chatMetaOverrides = ref(new Map());
 const importantByMessageUrl = ref(new Map());
 
 // profileCache[actor] = profile object from Graffiti, or null if we checked and found nothing
@@ -277,6 +299,9 @@ function setDiscoverStatus(msg) {
   discoverStatus.value = msg;
 }
 const chatListStatus = ref("");
+
+// Shared with Explore + MainLayout when joining a public Create from discovery
+const joiningDiscoverBusy = ref(false);
 
 // bump this when Important data changes in other views (lets Important page refresh)
 const importantTick = ref(0);
@@ -298,6 +323,25 @@ async function loadCreates() {
   if (!session.value) return;
   const objs = await drainDiscover([DISCOVERY_CHANNEL], GRAFFITI_OBJECT_SCHEMA, session.value);
   discoveredCreates.value = objs.filter((o) => o.value && o.value.activity === "Create");
+  const deleted = new Set();
+  const overrides = new Map();
+  for (const o of objs) {
+    const v = o && o.value;
+    if (!v) continue;
+    if (v.activity === "DeleteChat") {
+      if (v.channel) deleted.add(String(v.channel));
+      continue;
+    }
+    if (v.activity === "UpdateChatMeta" && v.channel) {
+      const ch = String(v.channel);
+      const ex = overrides.get(ch);
+      const ts = Number(v.updated || v.published || 0);
+      const exTs = ex ? Number(ex.updated || ex.published || 0) : 0;
+      if (!ex || ts >= exTs) overrides.set(ch, v);
+    }
+  }
+  deletedChatChannels.value = deleted;
+  chatMetaOverrides.value = overrides;
 }
 
 async function loadJoins() {
@@ -324,35 +368,300 @@ async function buildChatRows() {
   if (!session.value) return;
   await loadCreates();
   const joins = await loadJoins();
+  const me = session.value.actor;
+  const createByChannel = new Map();
+  for (const c of discoveredCreates.value) {
+    if (c && c.value && c.value.channel) createByChannel.set(c.value.channel, c);
+  }
+
+  function directPeerFromMeta(channel, otherActor) {
+    if (otherActor && otherActor !== me) return otherActor;
+    const c = createByChannel.get(channel);
+    if (!c || !c.value) return null;
+    // For the recipient view, Create.otherActor is me, so the peer is the creator.
+    if (c.actor !== me) return c.actor;
+    // For the sender view, Create.otherActor is the peer.
+    return c.value.otherActor || null;
+  }
+
   const byChannel = new Map();
   for (const j of joins) {
     const v = j.value;
+    if (deletedChatChannels.value.has(String(v.channel || ""))) continue;
+    const kind = v.chatKind || "group";
+    const ov = chatMetaOverrides.value.get(String(v.channel || ""));
+    const peer = kind === "direct" ? directPeerFromMeta(v.channel, v.otherActor) : null;
+    const c = createByChannel.get(v.channel);
     byChannel.set(v.channel, {
       channel: v.channel,
-      title: v.title,
-      folder: v.folder,
+      title: kind === "group" && ov && ov.title ? ov.title : v.title,
+      folder: kind === "direct" ? "People" : (kind === "group" && ov && ov.folder ? ov.folder : v.folder),
       source: "join",
-      chatKind: v.chatKind || "group",
-      otherActor: v.otherActor != null && v.otherActor !== "" ? v.otherActor : null,
+      chatKind: kind,
+      otherActor: peer,
+      target: v.target || null,
+      published: v.published || 0,
+      // Graffiti object URL for this Join in *my* inbox — delete this to remove the chat from my list or leave a group
+      joinUrl: j.url || null,
+      // Create URL exists when this channel has a known Create post (useful fallback for owner cleanup)
+      createUrl: c && c.url ? c.url : null,
+      createActor: c && c.actor ? c.actor : null,
     });
   }
   for (const c of discoveredCreates.value) {
-    if (c.actor !== session.value.actor) continue;
     const v = c.value;
+    if (deletedChatChannels.value.has(String(v.channel || ""))) continue;
+    const kind = v.chatKind || "group";
+    const ov = chatMetaOverrides.value.get(String(v.channel || ""));
+    const isMine = c.actor === me;
+    const isDirectForMe = kind === "direct" && v.otherActor === me;
+    // Groups should come from my Join state. Create-only rows are used only for directs.
+    if (kind !== "direct") continue;
+    if (!isMine && !isDirectForMe) continue;
     if (!byChannel.has(v.channel)) {
+      const peer = kind === "direct" ? directPeerFromMeta(v.channel, v.otherActor) : null;
       byChannel.set(v.channel, {
         channel: v.channel,
-        title: v.title,
-        folder: v.folder,
+        title: kind === "group" && ov && ov.title ? ov.title : v.title,
+        folder: kind === "direct" ? "People" : (kind === "group" && ov && ov.folder ? ov.folder : v.folder),
         source: "create",
-        chatKind: v.chatKind || "group",
-        otherActor: v.otherActor || null,
+        chatKind: kind,
+        otherActor: peer,
+        target: v.id || null,
+        published: v.published || 0,
+        joinUrl: null,
+        createUrl: c.url || null,
+        createActor: c.actor || null,
       });
     }
   }
-  const list = Array.from(byChannel.values());
+  let list = Array.from(byChannel.values());
+  // Older bugs could create multiple direct channels for the same peer. Keep one visible row per peer.
+  // Preference: row with joinUrl (user can leave/delete cleanly), then newest published timestamp.
+  const byPeer = new Map();
+  const keep = [];
+  for (const r of list) {
+    if (r.chatKind !== "direct" || !r.otherActor) {
+      keep.push(r);
+      continue;
+    }
+    const ex = byPeer.get(r.otherActor);
+    if (!ex) {
+      byPeer.set(r.otherActor, r);
+      continue;
+    }
+    const exScore = (ex.joinUrl ? 1 : 0) * 1_000_000_000_000 + (ex.published || 0);
+    const rScore = (r.joinUrl ? 1 : 0) * 1_000_000_000_000 + (r.published || 0);
+    if (rScore > exScore) byPeer.set(r.otherActor, r);
+  }
+  list = keep.concat(Array.from(byPeer.values()));
+  const directPeers = Array.from(new Set(list.filter((r) => r.chatKind === "direct" && r.otherActor).map((r) => r.otherActor)));
+  if (directPeers.length > 0) {
+    await ensureProfiles(directPeers);
+    for (const r of list) {
+      if (r.chatKind !== "direct" || !r.otherActor) continue;
+      r.title = "With " + publicDisplayLine(profileCache[r.otherActor]);
+      r.folder = "People";
+    }
+  }
   list.sort((a, b) => a.title.localeCompare(b.title));
   chatRows.value = list;
+}
+
+/**
+ * Remove *my* Join post so the chat disappears from my sidebar. Does not delete the room or other people’s messages.
+ */
+async function removeMyJoinFromList(sessionObj, row) {
+  if (!sessionObj) return;
+  const raw = toRaw(sessionObj);
+  if (!row) {
+    throw new Error("Chat row missing. Refresh and try again.");
+  }
+  if (!row.joinUrl && row.createUrl && row.source === "create" && row.chatKind === "direct") {
+    // Fallback for legacy create-only direct rows created before join metadata settled.
+    await graffiti.delete(row.createUrl, raw);
+    chatRows.value = chatRows.value.filter((r) => r.channel !== row.channel);
+    await loadEverything();
+    const rid0 = routeIdFromChannel(String(row.channel));
+    if (router && router.currentRoute.value.name === "chat" && String(router.currentRoute.value.params.chatId || "") === rid0) {
+      router.push({ name: "home" });
+    }
+    return;
+  }
+  if (!row.joinUrl) {
+    throw new Error("We could not find your personal link to this chat. Try refreshing the page.");
+  }
+  await graffiti.delete(row.joinUrl, raw);
+  chatRows.value = chatRows.value.filter((r) => r.channel !== row.channel);
+  await loadEverything();
+  const rid = routeIdFromChannel(String(row.channel));
+  if (router && router.currentRoute.value.name === "chat" && String(router.currentRoute.value.params.chatId || "") === rid) {
+    router.push({ name: "home" });
+  }
+}
+
+async function updateMyChatMetadata(sessionObj, row, { title, folder }) {
+  if (!sessionObj) return;
+  if (!row) throw new Error("Chat row missing.");
+  const raw = toRaw(sessionObj);
+  const t = String(title || "").trim();
+  if (!t) throw new Error("Chat name cannot be empty.");
+  const f = String(folder || "").trim() || (row.chatKind === "direct" ? "People" : "Groups");
+
+  if (row.chatKind === "group") {
+    await graffiti.post(
+      JSON.parse(
+        JSON.stringify({
+          channels: [DISCOVERY_CHANNEL],
+          value: {
+            activity: "UpdateChatMeta",
+            type: "Chat",
+            id: crypto.randomUUID(),
+            channel: row.channel,
+            title: t,
+            folder: f,
+            updated: Date.now(),
+          },
+        })
+      ),
+      raw
+    );
+    const nextMap = new Map(chatMetaOverrides.value);
+    nextMap.set(row.channel, { title: t, folder: f, updated: Date.now() });
+    chatMetaOverrides.value = nextMap;
+    chatRows.value = chatRows.value.map((r) => {
+      if (r.channel !== row.channel) return r;
+      return { ...r, title: t, folder: f };
+    });
+    await loadEverything();
+    return;
+  }
+
+  if (!row.joinUrl) {
+    throw new Error("We could not find your chat link to update. Refresh and try again.");
+  }
+  const nextJoin = {
+    activity: "Join",
+    id: crypto.randomUUID(),
+    target: row.target || crypto.randomUUID(),
+    title: t,
+    folder: row.chatKind === "direct" ? "People" : f,
+    channel: row.channel,
+    published: Date.now(),
+    chatKind: row.chatKind || "group",
+  };
+  if (row.chatKind === "direct" && row.otherActor) nextJoin.otherActor = row.otherActor;
+  await graffiti.post(
+    JSON.parse(
+      JSON.stringify({
+        channels: [personalInboxChannel(sessionObj.actor)],
+        value: nextJoin,
+      })
+    ),
+    raw
+  );
+  await graffiti.delete(row.joinUrl, raw);
+  // immediate sidebar update
+  chatRows.value = chatRows.value.map((r) => {
+    if (r.channel !== row.channel) return r;
+    return { ...r, title: nextJoin.title, folder: nextJoin.folder };
+  });
+  await loadEverything();
+}
+
+async function deleteGroupForEveryone(sessionObj, row) {
+  if (!sessionObj) return;
+  if (!row || row.chatKind !== "group") {
+    throw new Error("Only group chats can be deleted for everyone.");
+  }
+  if (!row.createUrl) {
+    throw new Error("Could not find the group owner record. Try refreshing first.");
+  }
+  const raw = toRaw(sessionObj);
+  // 1) Delete the group Create record so new users cannot join it.
+  await graffiti.delete(row.createUrl, raw);
+  // 2) Post a global deletion marker so all participants hide it from their lists.
+  await graffiti.post(
+    JSON.parse(
+      JSON.stringify({
+        channels: [DISCOVERY_CHANNEL],
+        value: {
+          activity: "DeleteChat",
+          type: "Chat",
+          id: crypto.randomUUID(),
+          channel: row.channel,
+          title: row.title,
+          deletedAt: Date.now(),
+        },
+      })
+    ),
+    raw
+  );
+  // 3) Also remove the current user's Join if present.
+  if (row.joinUrl) {
+    try {
+      await graffiti.delete(row.joinUrl, raw);
+    } catch {
+      /* if already missing that's okay */
+    }
+  }
+  deletedChatChannels.value = new Set([...deletedChatChannels.value, row.channel]);
+  chatRows.value = chatRows.value.filter((r) => r.channel !== row.channel);
+  await loadEverything();
+  const rid = routeIdFromChannel(String(row.channel));
+  if (router && router.currentRoute.value.name === "chat" && String(router.currentRoute.value.params.chatId || "") === rid) {
+    router.push({ name: "home" });
+  }
+}
+
+/**
+ * Join a public Create (same payload shape as creating a chat — avoids null / proxy issues in the SDK).
+ */
+async function joinDiscoverChat(obj, onRoutePush) {
+  if (joiningDiscoverBusy.value) return;
+  joiningDiscoverBusy.value = true;
+  setDiscoverStatus("Joining chat…");
+  const s = session.value;
+  if (!s) {
+    joiningDiscoverBusy.value = false;
+    return;
+  }
+  const v = obj && obj.value;
+  if (!v || v.id == null || !v.channel) {
+    setDiscoverStatus("Join failed: this invite looks broken. Try refreshing the page.");
+    joiningDiscoverBusy.value = false;
+    return;
+  }
+  const kind = v.chatKind || "group";
+  const me = s.actor;
+  const directPeer = kind === "direct" ? (v.otherActor === me ? obj.actor : v.otherActor) : null;
+  const joinVal = {
+    activity: "Join",
+    id: crypto.randomUUID(),
+    target: v.id,
+    title: (v.title != null && String(v.title).trim()) || "Chat",
+    folder: kind === "direct" ? "People" : ((v.folder != null && String(v.folder)) || "Groups"),
+    channel: v.channel,
+    published: Date.now(),
+    chatKind: kind,
+  };
+  if (kind === "direct" && directPeer != null && directPeer !== "") {
+    joinVal.otherActor = directPeer;
+  }
+  const doc = {
+    channels: [personalInboxChannel(s.actor)],
+    value: joinVal,
+  };
+  try {
+    await graffiti.post(JSON.parse(JSON.stringify(doc)), toRaw(s));
+    setDiscoverStatus("Joined!");
+    await loadEverything();
+    if (onRoutePush) onRoutePush({ name: "chat", params: { chatId: routeIdFromChannel(String(v.channel)) } });
+  } catch (e) {
+    setDiscoverStatus("Join failed: " + (e && e.message ? e.message : String(e)));
+  } finally {
+    joiningDiscoverBusy.value = false;
+  }
 }
 
 async function refreshUserHandle() {
@@ -453,21 +762,15 @@ function formatTime(ts) {
 const HomeView = {
   name: "HomeView",
   template:
-    '<div class="main-page-full"><div class="placeholder main-page-inner"><p>Your thread opens in this area. Use the <strong>Chats</strong> list on the left, or the <strong>Explore</strong> tab (sidebar) to find people and start a new chat.</p></div></div>',
+    '<div class="main-page-full"><div class="placeholder main-page-inner"><p>Your thread opens in this area. Use the <strong>Chats</strong> list on the left, or <strong>Explore</strong> to find people and start something new.</p></div></div>',
 };
 
 /**
- * Hub: search public profile index, start a 1:1, or open the new-group modal (parent provides it).
+ * Full-page Explore: profile search (client-side), start a 1:1, create a group (modal from shell), join public invites.
+ * Renders in the main panel on `/explore` so it feels like a real page, not only a sidebar.
  */
-const ExploreView = {
-  name: "ExploreView",
-  props: {
-    // Public “Create” posts on the class discovery channel (same list the old Chats sidebar used)
-    availableJoins: { type: Array, default: () => [] },
-    dStatus: { type: String, default: "" },
-    joining: { type: Boolean, default: false },
-  },
-  emits: ["join"],
+const ExplorePageView = {
+  name: "ExplorePageView",
   inject: ["getSession", "onRouter", "openGroupCreate"],
   data() {
     return {
@@ -475,6 +778,11 @@ const ExploreView = {
       busy: false,
       err: "",
       directBusy: null,
+      previewOpen: false,
+      previewBusy: false,
+      previewErr: "",
+      previewObj: null,
+      previewMessages: [],
     };
   },
   computed: {
@@ -494,6 +802,16 @@ const ExploreView = {
         return u.includes(s) || f.includes(s) || l.includes(s) || `${f} ${l}`.trim().includes(s);
       });
     },
+    availableJoins() {
+      const joined = new Set(chatRows.value.map((r) => r.channel));
+      return discoveredCreates.value.filter((c) => c.value && !deletedChatChannels.value.has(String(c.value.channel || "")) && (c.value.chatKind || "group") !== "direct" && !joined.has(c.value.channel));
+    },
+    dStatus() {
+      return discoverStatus.value;
+    },
+    joining() {
+      return joiningDiscoverBusy.value;
+    },
   },
   async mounted() {
     this.busy = true;
@@ -510,11 +828,16 @@ const ExploreView = {
   methods: {
     photoFor(actor) {
       const p = profileCache[actor];
-      return profilePhotoSrc(p);
+      return profileImageSrc(p);
     },
     fullName(r) {
       const n = [r.firstName, r.lastName].filter(Boolean).join(" ").trim();
       return n || "Name not set";
+    },
+    /** Tiny technical id — only for support / debugging, not the main identity */
+    shortActor(a) {
+      if (!a) return "";
+      return a.length > 22 ? a.slice(0, 20) + "…" : a;
     },
     goProfile(actor) {
       this.onRouter().push({ name: "profile", params: { actor } });
@@ -543,32 +866,72 @@ const ExploreView = {
     startGroup() {
       if (typeof this.openGroupCreate === "function") this.openGroupCreate();
     },
+    async doJoin(obj) {
+      await joinDiscoverChat(obj, (loc) => this.onRouter().push(loc));
+    },
+    async openPreview(obj) {
+      if (!obj || !obj.value || !obj.value.channel || this.previewBusy) return;
+      this.previewObj = obj;
+      this.previewOpen = true;
+      this.previewBusy = true;
+      this.previewErr = "";
+      this.previewMessages = [];
+      try {
+        const rows = await drainDiscover([obj.value.channel], GRAFFITI_OBJECT_SCHEMA, this.me);
+        const msgs = rows
+          .filter((o) => o && o.value && o.value.activity === "Send")
+          .sort((a, b) => (a.value.published || 0) - (b.value.published || 0))
+          .slice(-12);
+        this.previewMessages = msgs;
+        await ensureProfiles(
+          msgs
+            .map((m) => (m.value && m.value.actor) || m.actor)
+            .filter(Boolean)
+        );
+      } catch (e) {
+        this.previewErr = "Could not load preview: " + ((e && e.message) || String(e));
+      } finally {
+        this.previewBusy = false;
+      }
+    },
+    closePreview() {
+      if (this.previewBusy) return;
+      this.previewOpen = false;
+      this.previewErr = "";
+      this.previewObj = null;
+      this.previewMessages = [];
+    },
+    senderLine(msg) {
+      const actor = (msg && msg.value && msg.value.actor) || (msg && msg.actor) || "";
+      const p = actor ? profileCache[actor] : null;
+      return publicDisplayLine(p);
+    },
+    joinTitle(obj) {
+      const v = obj && obj.value;
+      const ch = v && v.channel ? String(v.channel) : "";
+      const ov = ch ? chatMetaOverrides.value.get(ch) : null;
+      return (ov && ov.title) || (v && v.title) || "Chat";
+    },
+    joinFolder(obj) {
+      const v = obj && obj.value;
+      const ch = v && v.channel ? String(v.channel) : "";
+      const ov = ch ? chatMetaOverrides.value.get(ch) : null;
+      return (ov && ov.folder) || (v && v.folder) || "";
+    },
+    async joinFromPreview() {
+      if (!this.previewObj || this.previewBusy) return;
+      await this.doJoin(this.previewObj);
+      this.closePreview();
+    },
   },
   template: `
-  <div class="sidebar-embed explore-page" aria-label="Explore people">
-    <div class="sidebar-embed-scroll">
+  <div class="explore-page explore-page-main main-page-full" aria-label="Explore people">
+    <div class="main-page-inner card explore-main-card">
       <h1 class="page-title">Explore</h1>
-      <p class="page-lead">Search people, start a private message, or add a new group — all from this column.</p>
-
-      <div class="explore-actions">
-        <button type="button" class="btn btn-primary" @click="startGroup">＋ New chat</button>
-        <p class="explore-hint">Creates a new conversation — you name it and pick a folder in the form.</p>
-      </div>
-
-      <div class="explore-discover">
-        <div class="section-label">Chats to join</div>
-        <p class="inline-status explore-discover-status">{{ dStatus }}</p>
-        <ul class="discover-list" role="list">
-          <li v-for="(obj, j) in availableJoins" :key="(obj.value && obj.value.id) || j" class="join-row">
-            <span>{{ obj.value && obj.value.title ? obj.value.title : "Chat" }} · {{ (obj.value && obj.value.folder) || "" }}</span>
-            <button type="button" class="btn btn-secondary btn-tiny" :disabled="joining" @click="$emit('join', obj)">Join</button>
-          </li>
-          <li v-if="availableJoins.length === 0" class="discover-list-empty">No new public invites, or you already joined them all.</li>
-        </ul>
-      </div>
+      <p class="page-lead">Search by <strong>username</strong> or name, start a private message, spin up a group, or join a public invite — same pink list you use everywhere.</p>
 
       <label class="search-label">Search people</label>
-      <input v-model="q" class="search-input" type="search" placeholder="Try a username, first or last name…" autocomplete="off" />
+      <input v-model="q" class="search-input" type="search" placeholder="Username, first name, or last name…" autocomplete="off" />
 
       <p v-if="err" class="error-msg" role="alert">{{ err }}</p>
       <p v-if="busy" class="inline-status">Loading directory…</p>
@@ -576,22 +939,66 @@ const ExploreView = {
       <ul v-else class="explore-results" role="list">
         <li v-for="r in hits" :key="r.actor" class="explore-card card">
           <div class="explore-card-av">
-            <img v-if="photoFor(r.actor)" :src="photoFor(r.actor)" alt="" class="explore-av" />
+            <graffiti-media-img v-if="photoFor(r.actor)" :src="photoFor(r.actor)" img-class="explore-av" alt="" />
             <div v-else class="explore-av ph" aria-hidden="true">{{ (r.username || r.actor).charAt(0).toUpperCase() }}</div>
           </div>
           <div class="explore-card-body">
             <div class="explore-line1">{{ fullName(r) }}</div>
             <div class="explore-line2">@{{ (r.username || "unknown").replace(/^@/, "") }}</div>
+            <div class="explore-line-actor" title="Internal id (only if you need it)">{{ shortActor(r.actor) }}</div>
           </div>
           <div class="explore-card-actions">
             <button type="button" class="btn btn-ghost" @click="goProfile(r.actor)">Profile</button>
-            <button type="button" class="btn btn-secondary" :disabled="directBusy" @click="startDirect(r)">
+            <button type="button" class="btn btn-secondary" :disabled="!!directBusy" @click="startDirect(r)">
               {{ directBusy === r.actor ? "Opening…" : "Message" }}
             </button>
           </div>
         </li>
         <li v-if="hits.length === 0 && !busy" class="explore-empty">No one matches that search yet, or the directory is still empty. When classmates save a public username on their profile, they show up here.</li>
       </ul>
+
+      <div class="explore-actions explore-actions-main">
+        <button type="button" class="btn btn-primary" @click="startGroup">＋ New group</button>
+        <p class="explore-hint">Name the conversation and pick a folder. New groups default to <strong>Groups</strong> (and always show under <strong>All</strong>).</p>
+      </div>
+
+      <div class="explore-discover">
+        <div class="section-label">Chats you can join</div>
+        <p class="inline-status explore-discover-status">{{ dStatus }}</p>
+        <ul class="discover-list" role="list">
+          <li v-for="(obj, j) in availableJoins" :key="(obj.value && obj.value.id) || j" class="join-row">
+            <span>{{ joinTitle(obj) }} · {{ joinFolder(obj) }}</span>
+            <div class="join-row-actions">
+              <button type="button" class="btn btn-ghost btn-tiny" :disabled="joining" @click="openPreview(obj)">Preview</button>
+              <button type="button" class="btn btn-secondary btn-tiny" :disabled="joining" @click="doJoin(obj)">Join</button>
+            </div>
+          </li>
+          <li v-if="availableJoins.length === 0" class="discover-list-empty">No new public invites, or you already joined them all.</li>
+        </ul>
+      </div>
+
+      <div v-show="previewOpen" class="modal" role="dialog" aria-modal="true" aria-labelledby="join-preview-title">
+        <div class="modal-backdrop" @click="closePreview"></div>
+        <div class="modal-content card modal-narrow" @click.stop>
+          <h2 id="join-preview-title">Preview before joining</h2>
+          <p class="modal-chat-name">{{ joinTitle(previewObj) }}</p>
+          <p v-if="previewBusy" class="inline-status">Loading preview…</p>
+          <p v-if="previewErr" class="error-msg" role="alert">{{ previewErr }}</p>
+          <ul v-if="!previewBusy && !previewErr" class="preview-msg-list">
+            <li v-for="m in previewMessages" :key="m.url" class="preview-msg-item">
+              <div class="preview-msg-meta">{{ senderLine(m) }} · {{ formatTime(m.value && m.value.published) }}</div>
+              <div class="preview-msg-body">{{ (m.value && m.value.content) || "(no text)" }}</div>
+            </li>
+            <li v-if="previewMessages.length === 0" class="discover-list-empty">No messages yet in this chat.</li>
+          </ul>
+          <div class="modal-actions">
+            <button type="button" class="btn btn-ghost" :disabled="previewBusy || joining" @click="closePreview">Close</button>
+            <button type="button" class="btn btn-primary" :disabled="previewBusy || joining || !previewObj" @click="joinFromPreview">
+              {{ joining ? "Joining…" : "Join chat" }}
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
   `,
@@ -601,7 +1008,7 @@ const ChatView = {
   name: "ChatView",
   components: { MessageBubble },
   props: { chatId: { type: String, required: true } },
-  inject: ["getSession", "onRouter"],
+  inject: ["getSession", "onRouter", "askRemoveChatFromChatView"],
   data() {
     return {
       messages: [],
@@ -786,8 +1193,17 @@ const ChatView = {
   <div class="chat-wrap">
     <div class="chat-view" v-if="row()">
       <div class="chat-header">
-        <h2 class="chat-title">{{ row().title }}</h2>
-        <span class="folder-badge">{{ row().folder }}</span>
+        <div class="chat-header-main">
+          <h2 class="chat-title">{{ row().title }}</h2>
+          <span class="folder-badge">{{ row().folder }}</span>
+        </div>
+        <button
+          v-if="row().joinUrl || (row().source === 'create' && row().createUrl)"
+          type="button"
+          class="btn btn-ghost btn-tiny chat-header-more"
+          :title="row().chatKind === 'direct' ? 'Remove from your chat list' : 'Leave this group'"
+          @click="askRemoveChatFromChatView(row())"
+        >⋯</button>
       </div>
       <p v-if="loadBusy" class="inline-status" style="padding:0.75rem 1rem 0">Loading messages…</p>
       <div class="messages-area" ref="scrollBox">
@@ -960,8 +1376,8 @@ const ProfileView = {
       }
       return "";
     },
-    avatarSrc() {
-      return profilePhotoSrc(this.p) || null;
+    avatarMediaSrc() {
+      return profileImageSrc(this.p) || "";
     },
     letter() {
       const n = this.nameLine;
@@ -1002,7 +1418,7 @@ const ProfileView = {
       <p v-if="err" class="error-msg" role="alert">{{ err }}</p>
       <div v-else>
       <div v-if="p" class="profile-hero">
-        <img v-if="avatarSrc" :src="avatarSrc" class="profile-avatar" alt="Profile" />
+        <graffiti-media-img v-if="avatarMediaSrc" :src="avatarMediaSrc" img-class="profile-avatar" alt="Profile" />
         <div v-else class="profile-avatar ph" aria-hidden="true">{{ letter }}</div>
         <div class="profile-text-block">
           <p v-if="p && p.username && (p.firstName || p.lastName)" class="profile-handle">@{{ (p.username || "").replace(/^@/, "") }}</p>
@@ -1020,14 +1436,20 @@ const ProfileView = {
 
 const ProfileEditView = {
   name: "ProfileEditView",
-  inject: ["getSession"],
+  inject: ["getSession", "getGraffiti"],
   data() {
     return {
       first: "",
       last: "",
       user: "",
-      // photoData: base64 data URL (stored in SetProfile) — we keep a copy here while editing
-      photoData: "",
+      // New file picked but not saved yet — uploaded with postMedia on Save
+      pendingFile: null,
+      // blob: URL for instant preview of pendingFile (revoked on clear / save / unmount)
+      previewBlobUrl: "",
+      // What Graffiti already has after last save (media URL or legacy https)
+      serverPhotoUrl: "",
+      // Legacy inline data URL still on the object until user saves again
+      legacyPhotoData: "",
       loadBusy: true,
       loadErr: "",
       saveErr: "",
@@ -1039,13 +1461,28 @@ const ProfileEditView = {
   created() {
     this.hydrate();
   },
+  unmounted() {
+    this.revokePreviewBlob();
+  },
   methods: {
+    revokePreviewBlob() {
+      if (this.previewBlobUrl && String(this.previewBlobUrl).startsWith("blob:")) {
+        try {
+          URL.revokeObjectURL(this.previewBlobUrl);
+        } catch {
+          /* ignore */
+        }
+      }
+      this.previewBlobUrl = "";
+    },
     async hydrate() {
       const s = this.getSession();
       this.loadBusy = true;
       this.loadErr = "";
       this.justSaved = false;
       this.fileErr = "";
+      this.pendingFile = null;
+      this.revokePreviewBlob();
       if (!s) {
         this.loadBusy = false;
         return;
@@ -1056,8 +1493,9 @@ const ProfileEditView = {
         this.first = (p && p.firstName) || "";
         this.last = (p && p.lastName) || "";
         this.user = (p && p.username) ? String(p.username).replace(/^@/, "") : "";
-        // new field photoData, or old photoURL link from earlier saves
-        this.photoData = (p && (p.photoData || p.photoURL)) || "";
+        this.serverPhotoUrl = (p && (p.photoUrl || p.photoURL)) ? String(p.photoUrl || p.photoURL).trim() : "";
+        const legacy = (p && p.photoData) ? String(p.photoData).trim() : "";
+        this.legacyPhotoData = legacy.startsWith("data:") ? legacy : "";
       } catch (e) {
         this.loadErr = "Loading profile: " + e.message;
       } finally {
@@ -1065,8 +1503,7 @@ const ProfileEditView = {
       }
     },
     /**
-     * read local file as a data URL so Graffiti can store a string the same as before
-     * (huge avatars are blocked so we do not break small-object limits)
+     * Keep the file in memory; preview is a blob URL (not the giant data URL we used to stuff into SetProfile).
      */
     onProfilePhotoFile(ev) {
       this.fileErr = "";
@@ -1076,21 +1513,23 @@ const ProfileEditView = {
         this.fileErr = "Pick an image (PNG, JPG, …)";
         return;
       }
-      if (f.size > 750 * 1024) {
-        this.fileErr = "Image is too large here — try a smaller one (under 750KB).";
+      const max = 10 * 1024 * 1024;
+      if (f.size > max) {
+        this.fileErr = "Image is too large — max 10MB for this class demo.";
         return;
       }
-      const r = new FileReader();
-      r.onload = () => {
-        this.photoData = r.result;
-      };
-      r.onerror = () => {
-        this.fileErr = "Could not read that file.";
-      };
-      r.readAsDataURL(f);
+      this.revokePreviewBlob();
+      this.pendingFile = f;
+      this.previewBlobUrl = URL.createObjectURL(f);
+      this.serverPhotoUrl = "";
+      this.legacyPhotoData = "";
+      if (ev.target) ev.target.value = "";
     },
     clearPhoto() {
-      this.photoData = "";
+      this.pendingFile = null;
+      this.revokePreviewBlob();
+      this.serverPhotoUrl = "";
+      this.legacyPhotoData = "";
     },
     async save() {
       const s = this.getSession();
@@ -1099,16 +1538,35 @@ const ProfileEditView = {
       this.saveErr = "";
       this.justSaved = false;
       try {
+        let photoUrl = null;
+        let photoData = null;
+        if (this.pendingFile) {
+          const g = this.getGraffiti();
+          try {
+            // Keep media payload minimal; null `allowed` can cause object-shape errors in some SDK paths.
+            photoUrl = await g.postMedia({ data: this.pendingFile }, toRaw(s));
+          } catch (e) {
+            throw new Error("Photo upload failed. Try a smaller JPG/PNG or remove the photo and save again. " + ((e && e.message) || String(e)));
+          }
+        } else if (this.serverPhotoUrl) {
+          photoUrl = this.serverPhotoUrl;
+        } else if (this.legacyPhotoData) {
+          photoData = this.legacyPhotoData;
+        }
         await saveFullProfile(s, {
           firstName: this.first,
           lastName: this.last,
           username: this.user,
-          photoData: this.photoData,
+          photoUrl,
+          photoData,
         });
         this.justSaved = true;
+        this.pendingFile = null;
+        this.revokePreviewBlob();
         await refreshProfileIndexList();
         await refreshUserHandle();
         importantTick.value++;
+        await this.hydrate();
       } catch (e) {
         this.saveErr = (e && e.message) || String(e);
       } finally {
@@ -1121,6 +1579,13 @@ const ProfileEditView = {
       const s = this.getSession();
       return s ? s.actor : "";
     },
+    /** Saved avatar (Graffiti URL / legacy) — shown with getMedia after you pick something new we use blob preview only */
+    savedPhotoSrcForDisplay() {
+      return (this.serverPhotoUrl || this.legacyPhotoData || "").trim();
+    },
+    showPhotoBlock() {
+      return !!(this.previewBlobUrl || this.savedPhotoSrcForDisplay);
+    },
   },
   template: `
   <div class="main-page-full">
@@ -1130,14 +1595,20 @@ const ProfileEditView = {
     <p class="inline-status" v-if="loadBusy" style="text-align:center">Loading…</p>
     <p v-if="loadErr" class="error-msg" role="alert">{{ loadErr }}</p>
     <form v-else class="edit-profile-form" @submit.prevent="save">
-      <div class="photo-edit-row" v-if="photoData">
-        <img :src="photoData" class="edit-photo-preview" alt="Preview" />
+      <div class="photo-edit-row" v-if="showPhotoBlock">
+        <img v-if="previewBlobUrl" :src="previewBlobUrl" class="edit-photo-preview" alt="Local preview" />
+        <graffiti-media-img
+          v-else-if="savedPhotoSrcForDisplay"
+          :src="savedPhotoSrcForDisplay"
+          img-class="edit-photo-preview"
+          alt="Saved profile photo"
+        />
         <button type="button" class="btn btn-ghost btn-tiny" @click="clearPhoto">Remove</button>
       </div>
       <label>
         Photo
         <input type="file" accept="image/*" @change="onProfilePhotoFile" />
-        <span class="field-hint">Saved as a data URL in Graffiti (fine for a class demo). You can add a new picture anytime.</span>
+        <span class="field-hint">Images upload with Graffiti <code>postMedia</code>; the saved profile stores the media URL (not the raw file bytes in the post).</span>
         <p v-if="fileErr" class="error-msg">{{ fileErr }}</p>
       </label>
       <label>
@@ -1165,14 +1636,14 @@ const ProfileEditView = {
 };
 
 /**
- * When you're on Explore or Important, the real UI is in the sidebar; the main column only shows this hint.
+ * Placeholder when no chat is open: Important still uses the sidebar; Explore is now a full main page.
  */
 const MainEmptyView = {
   name: "MainEmptyView",
   template: `
   <div class="main-page-full main-messages-placeholder">
     <div class="placeholder main-page-inner">
-      <p><strong>Messages</strong> show in this area when you open a chat. <strong>Explore</strong> and <strong>Important</strong> use the <strong>left column</strong> only — switch to the <strong>Chats</strong> tab to pick a room from your list.</p>
+      <p><strong>Messages</strong> show here when you open a chat. <strong>Important</strong> uses the <strong>left column</strong> for saved items. Open <strong>Explore</strong> for search and new groups, or <strong>Chats</strong> to pick a room.</p>
     </div>
   </div>
   `,
@@ -1181,11 +1652,15 @@ const MainEmptyView = {
 // -- shell: side bar + where the child route draws
 const MainLayout = {
   name: "MainLayout",
-  components: { ExploreView, ImportantView },
+  components: { ImportantView },
   inject: ["getSession", "onRouter"],
   provide() {
-    // Explore in the sidebar calls this to open the “new chat” modal
-    return { openGroupCreate: () => this.openNew() };
+    // Explore “New group” opens the modal with Groups as the default folder
+    return {
+      openGroupCreate: () => this.openNew({ defaultFolder: "Groups" }),
+      // Open the same delete / leave confirmation used from the sidebar
+      askRemoveChatFromChatView: (row) => this.askRemoveChat(row),
+    };
   },
   data() {
     return {
@@ -1196,7 +1671,15 @@ const MainLayout = {
       newStatus: "",
       newErr: "",
       creating: false,
-      joining: false,
+      /** Remove chat / leave group confirmation */
+      chatConfirm: null,
+      chatConfirmErr: "",
+      removeBusy: false,
+      listRemoveErr: "",
+      editTitle: "",
+      editFolder: "Groups",
+      editBusy: false,
+      editErr: "",
     };
   },
   computed: {
@@ -1229,7 +1712,7 @@ const MainLayout = {
     },
     availableJoins() {
       const joined = new Set(this.rows.map((r) => r.channel));
-      return this.creates.filter((c) => c.value && !joined.has(c.value.channel));
+      return this.creates.filter((c) => c.value && !deletedChatChannels.value.has(String(c.value.channel || "")) && (c.value.chatKind || "group") !== "direct" && !joined.has(c.value.channel));
     },
     chatsTabActive() {
       const n = this.$route.name;
@@ -1257,12 +1740,12 @@ const MainLayout = {
     setFolder(f) {
       this.selectedFolder = f;
     },
-    openNew() {
+    openNew(opts = {}) {
       this.modalOpen = true;
       this.newTitle = "";
       this.newErr = "";
       this.newStatus = "";
-      this.newFolder = "People";
+      this.newFolder = opts.defaultFolder != null ? opts.defaultFolder : "People";
     },
     closeNew() {
       this.modalOpen = false;
@@ -1289,50 +1772,95 @@ const MainLayout = {
         this.creating = false;
       }
     },
-    async joinChat(obj) {
-      if (this.joining) return;
-      this.joining = true;
-      setDiscoverStatus("Joining chat…");
+    askRemoveChat(row) {
+      if (this.removeBusy || !row) return;
+      this.listRemoveErr = "";
+      const canManage = !!row.joinUrl || (row.source === "create" && !!row.createUrl);
+      if (!canManage) {
+        this.listRemoveErr = "This line is still syncing — refresh the page, then try again.";
+        return;
+      }
+      this.chatConfirmErr = "";
+      const canDeleteGroupForAll =
+        row.chatKind === "group" &&
+        !!row.createUrl &&
+        !!this.session &&
+        row.createActor === this.session.actor;
+      this.chatConfirm = { kind: canDeleteGroupForAll ? "groupChoice" : (row.chatKind === "direct" ? "delete" : "leave"), row };
+      this.editTitle = row.title || "";
+      this.editFolder = row.chatKind === "direct" ? "People" : (row.folder || "Groups");
+      this.editErr = "";
+    },
+    cancelChatConfirm() {
+      if (this.removeBusy) return;
+      this.chatConfirm = null;
+      this.chatConfirmErr = "";
+      this.editErr = "";
+    },
+    openEditFromConfirm() {
+      if (!this.chatConfirm || !this.chatConfirm.row) return;
+      const row = this.chatConfirm.row;
+      if (!row.joinUrl) {
+        this.chatConfirmErr = "This chat cannot be edited yet. Refresh and try again.";
+        return;
+      }
+      this.editTitle = row.title || "";
+      this.editFolder = row.chatKind === "direct" ? "People" : (row.folder || "Groups");
+      this.editErr = "";
+      this.chatConfirm.kind = "edit";
+    },
+    async confirmChatRemove() {
+      if (!this.chatConfirm || this.removeBusy) return;
+      const { kind, row } = this.chatConfirm;
       const s = this.session;
-      if (!s) {
-        this.joining = false;
-        return;
-      }
-      const v = obj && obj.value;
-      if (!v || v.id == null || !v.channel) {
-        setDiscoverStatus("Join failed: this invite looks broken. Try refreshing the page.");
-        this.joining = false;
-        return;
-      }
-      // Same shape as runCreateGroupAndGo / runStartDirectMessage — the SDK can choke on
-      // null fields (e.g. otherActor on a group) or on Vue’s reactive proxy, so we build plain objects.
-      const kind = v.chatKind || "group";
-      const joinVal = {
-        activity: "Join",
-        id: crypto.randomUUID(),
-        target: v.id,
-        title: (v.title != null && String(v.title).trim()) || "Chat",
-        folder: (v.folder != null && String(v.folder)) || "Groups",
-        channel: v.channel,
-        published: Date.now(),
-        chatKind: kind,
-      };
-      if (kind === "direct" && v.otherActor != null && v.otherActor !== "") {
-        joinVal.otherActor = v.otherActor;
-      }
-      const doc = {
-        channels: [personalInboxChannel(s.actor)],
-        value: joinVal,
-      };
+      if (!s) return;
+      this.removeBusy = true;
+      this.chatConfirmErr = "";
+      globalStatus.value = kind === "leave" ? "Leaving group…" : "Removing chat…";
       try {
-        await graffiti.post(JSON.parse(JSON.stringify(doc)), toRaw(s));
-        setDiscoverStatus("Joined!");
-        await loadEverything();
-        this.onRouter().push({ name: "chat", params: { chatId: routeIdFromChannel(String(v.channel)) } });
+        await removeMyJoinFromList(s, row);
+        this.chatConfirm = null;
       } catch (e) {
-        setDiscoverStatus("Join failed: " + (e && e.message ? e.message : String(e)));
+        this.chatConfirmErr = e && e.message ? e.message : String(e);
       } finally {
-        this.joining = false;
+        this.removeBusy = false;
+        globalStatus.value = "";
+      }
+    },
+    async confirmEditChat() {
+      if (!this.chatConfirm || this.editBusy) return;
+      const row = this.chatConfirm.row;
+      const s = this.session;
+      if (!s) return;
+      this.editBusy = true;
+      this.editErr = "";
+      globalStatus.value = "Saving chat settings…";
+      try {
+        await updateMyChatMetadata(s, row, { title: this.editTitle, folder: this.editFolder });
+        this.chatConfirm = null;
+      } catch (e) {
+        this.editErr = e && e.message ? e.message : String(e);
+      } finally {
+        this.editBusy = false;
+        globalStatus.value = "";
+      }
+    },
+    async confirmDeleteGroupForEveryone() {
+      if (!this.chatConfirm || this.removeBusy) return;
+      const row = this.chatConfirm.row;
+      const s = this.session;
+      if (!s) return;
+      this.removeBusy = true;
+      this.chatConfirmErr = "";
+      globalStatus.value = "Deleting group…";
+      try {
+        await deleteGroupForEveryone(s, row);
+        this.chatConfirm = null;
+      } catch (e) {
+        this.chatConfirmErr = e && e.message ? e.message : String(e);
+      } finally {
+        this.removeBusy = false;
+        globalStatus.value = "";
       }
     },
     logout() {
@@ -1388,17 +1916,9 @@ const MainLayout = {
     <p class="global-status">{{ gStatus }}</p>
 
     <div class="app-layout">
-      <div class="chats-layout" :class="{ 'chats-layout--wide-sidebar': $route.name === 'explore' }">
-        <aside class="sidebar card" :class="{ 'sidebar--wide': $route.name === 'explore' }">
-          <explore-view
-            v-if="$route.name === 'explore'"
-            key="ex"
-            :available-joins="availableJoins"
-            :d-status="dStatus"
-            :joining="joining"
-            @join="joinChat"
-          />
-          <important-view v-else-if="showImportantSidebar" key="im" />
+      <div class="chats-layout">
+        <aside class="sidebar card">
+          <important-view v-if="showImportantSidebar" key="im" />
           <template v-else>
             <div class="sidebar-section">
               <div class="section-label">Folders</div>
@@ -1412,9 +1932,10 @@ const MainLayout = {
 
             <div class="sidebar-section flex-grow">
               <div class="section-label">Your chats</div>
+              <p v-if="listRemoveErr" class="error-msg" role="alert">{{ listRemoveErr }}</p>
               <p class="inline-status">{{ listStatus }}</p>
               <ul class="chat-list">
-                <li v-for="r in filtered" :key="r.channel">
+                <li v-for="r in filtered" :key="r.channel" class="chat-list-item">
                   <router-link
                     :to="{ name: 'chat', params: { chatId: channelToRouteId(r.channel) } }"
                     class="chat-item"
@@ -1423,6 +1944,15 @@ const MainLayout = {
                     <span class="chat-item-title">{{ r.title }}</span>
                     <span class="chat-item-meta">{{ r.folder }}</span>
                   </router-link>
+                  <div class="chat-row-more" v-if="r.joinUrl || (r.source === 'create' && r.createUrl)">
+                    <button
+                      type="button"
+                      class="btn-chat-more"
+                      :title="r.chatKind === 'direct' ? 'Remove this chat from your list' : (r.createActor === session.actor ? 'Group actions (edit, leave, or delete for everyone)' : 'Leave this group')"
+                      :disabled="removeBusy"
+                      @click.prevent="askRemoveChat(r)"
+                    >⋯</button>
+                  </div>
                 </li>
               </ul>
               <p v-if="!listStatus && filtered.length===0" class="inline-status">No chats in this folder. Use <strong>Explore</strong> to find people or start a new chat.</p>
@@ -1462,6 +1992,78 @@ const MainLayout = {
         </form>
       </div>
     </div>
+
+    <div v-show="chatConfirm" id="modal-chat-confirm" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-chat-confirm-title">
+      <div class="modal-backdrop" @click="cancelChatConfirm"></div>
+      <div class="modal-content card modal-narrow" @click.stop>
+        <h2 id="modal-chat-confirm-title">{{
+          !chatConfirm ? '' :
+          chatConfirm.kind === 'edit' ? 'Edit chat' :
+          chatConfirm.kind === 'groupChoice' ? 'Group actions' :
+          chatConfirm.kind === 'leave' ? 'Leave this group?' : 'Delete this chat?'
+        }}</h2>
+        <div v-if="chatConfirm && chatConfirm.kind === 'edit'" class="edit-chat-fields">
+          <label>
+            Chat name
+            <input v-model="editTitle" type="text" maxlength="120" placeholder="Chat name" />
+          </label>
+          <label>
+            Category
+            <select v-model="editFolder" :disabled="chatConfirm.row.chatKind === 'direct'">
+              <option value="People">People</option>
+              <option value="Groups">Groups</option>
+              <option value="Verification">Verification</option>
+            </select>
+          </label>
+          <p v-if="chatConfirm.row.chatKind === 'direct'" class="field-hint">Direct chats stay in <strong>People</strong>.</p>
+        </div>
+        <p v-if="chatConfirm && chatConfirm.kind === 'groupChoice'" class="modal-body-text">Choose one action: leave only for yourself, or delete this group for everyone.</p>
+        <p v-else-if="chatConfirm && chatConfirm.kind === 'leave'" class="modal-body-text">You will stop seeing this conversation in your list. <strong>Everyone else stays in the group</strong> — nothing is erased for them.</p>
+        <p v-else-if="chatConfirm && chatConfirm.kind !== 'edit'" class="modal-body-text">This removes this chat <strong>from your list only</strong>. It does not erase the shared conversation for everyone else.</p>
+        <p v-if="chatConfirm" class="modal-chat-name">{{ chatConfirm.row.title }}</p>
+        <p v-if="chatConfirmErr" class="error-msg" role="alert">{{ chatConfirmErr }}</p>
+        <p v-if="editErr" class="error-msg" role="alert">{{ editErr }}</p>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-ghost" :disabled="removeBusy" @click="cancelChatConfirm">Cancel</button>
+          <button
+            v-if="chatConfirm && chatConfirm.kind !== 'edit' && chatConfirm.row && chatConfirm.row.joinUrl"
+            type="button"
+            class="btn btn-secondary btn-edit-chat"
+            :disabled="removeBusy || editBusy"
+            @click="openEditFromConfirm"
+          >Edit chat</button>
+          <button
+            v-if="chatConfirm && chatConfirm.kind === 'groupChoice'"
+            type="button"
+            class="btn btn-secondary"
+            :disabled="removeBusy"
+            @click="chatConfirm.kind = 'leave'"
+          >Leave group</button>
+          <button
+            v-if="chatConfirm && chatConfirm.kind === 'groupChoice'"
+            type="button"
+            class="btn btn-primary btn-danger-soft"
+            :disabled="removeBusy"
+            @click="confirmDeleteGroupForEveryone"
+          >{{ removeBusy ? 'Deleting…' : 'Delete group for everyone' }}</button>
+          <button
+            v-if="chatConfirm && chatConfirm.kind === 'edit'"
+            type="button"
+            class="btn btn-primary"
+            :disabled="editBusy"
+            @click="confirmEditChat"
+          >{{ editBusy ? 'Saving…' : 'Save changes' }}</button>
+          <button
+            v-if="!chatConfirm || (chatConfirm.kind !== 'groupChoice' && chatConfirm.kind !== 'edit')"
+            type="button"
+            class="btn btn-primary"
+            :class="{ 'btn-danger-soft': chatConfirm && chatConfirm.kind === 'delete' }"
+            :disabled="removeBusy"
+            @click="confirmChatRemove"
+          >{{ removeBusy ? (chatConfirm && chatConfirm.kind === 'leave' ? 'Leaving…' : 'Removing…') : (chatConfirm && chatConfirm.kind === 'leave' ? 'Leave group' : 'Delete chat') }}</button>
+        </div>
+      </div>
+    </div>
   </div>
   `,
 };
@@ -1471,6 +2073,7 @@ const Root = {
   name: "Root",
   setup() {
     provide("getSession", () => session.value);
+    provide("getGraffiti", () => graffiti);
     provide("onRouter", () => router);
     const onLogin = () => {
       loginMsg.value = "Opening Graffiti login…";
@@ -1505,7 +2108,7 @@ const routes = [
     children: [
       { path: "", name: "home", component: HomeView, meta: { title: "Home" } },
       { path: "chat/:chatId", name: "chat", component: ChatView, props: true, meta: { title: "Chat" } },
-      { path: "explore", name: "explore", component: MainEmptyView, meta: { title: "Explore" } },
+      { path: "explore", name: "explore", component: ExplorePageView, meta: { title: "Explore" } },
       { path: "important", name: "important", component: MainEmptyView, meta: { title: "Important" } },
       { path: "profile/edit", name: "profileEdit", component: ProfileEditView, meta: { title: "Edit profile" } },
       { path: "profile/:actor", name: "profile", component: ProfileView, props: true, meta: { title: "Profile" } },
@@ -1541,4 +2144,5 @@ graffiti.sessionEvents.addEventListener("initialized", () => {});
 
 const app = createApp(Root);
 app.use(router);
+app.component("GraffitiMediaImg", GraffitiMediaImg);
 app.mount("#app");

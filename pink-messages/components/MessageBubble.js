@@ -6,8 +6,8 @@
 
 function localPhotoSrc(p) {
   if (!p) return null;
-  const s = p.photoData || p.photoURL;
-  return s && String(s).trim() ? s.trim() : null;
+  const s = (p.photoUrl && String(p.photoUrl).trim()) || (p.photoData && String(p.photoData).trim()) || (p.photoURL && String(p.photoURL).trim()) || "";
+  return s || null;
 }
 
 function localFormatTime(ts) {
@@ -97,7 +97,7 @@ export const MessageBubble = {
       <p v-if="showChatTitle && chatTitle" class="msg-chat-title">{{ chatTitle }}</p>
       <div class="msg-meta" @click="onOpenProfile">
         <div class="avatar-wrap" @click.stop="onOpenProfile">
-          <img v-if="photoSrc" :src="photoSrc" class="msg-avatar" alt="" />
+          <graffiti-media-img v-if="photoSrc" :src="photoSrc" img-class="msg-avatar" alt="" />
           <div v-else class="msg-avatar ph" aria-hidden="true">{{ avatarInitial }}</div>
         </div>
         <span class="sender-line">
