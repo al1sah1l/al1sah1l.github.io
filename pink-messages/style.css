@@ -973,6 +973,57 @@ main.main-panel {
   background: linear-gradient(180deg, #fffefb 0%, var(--bg) 100%);
 }
 
+/* Chat switch loading — placeholder bubbles with shimmer (different purpose than hover polish) */
+.chat-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  min-height: 8rem;
+}
+
+.chat-skeleton-row {
+  display: flex;
+  width: 100%;
+}
+
+.chat-skeleton-row--theirs {
+  justify-content: flex-start;
+}
+
+.chat-skeleton-row--mine {
+  justify-content: flex-end;
+}
+
+.chat-skeleton-bubble {
+  height: 2.6rem;
+  border-radius: 14px;
+  background: linear-gradient(90deg, var(--bg-deep) 0%, #fce7f3 40%, var(--bg-deep) 80%);
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.1s ease-in-out infinite;
+  border: 1px solid rgba(232, 121, 249, 0.25);
+}
+
+.chat-skeleton-bubble--s1 {
+  width: 62%;
+}
+
+.chat-skeleton-bubble--s2 {
+  width: 78%;
+}
+
+.chat-skeleton-bubble--s3 {
+  width: 48%;
+}
+
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: -100% 0;
+  }
+}
+
 .msg-row {
   display: flex;
   width: 100%;
@@ -984,6 +1035,47 @@ main.main-panel {
 
 .msg-row.theirs {
   justify-content: flex-start;
+}
+
+/* New message entry: bounce the bubble itself (outgoing) — easier to see than whole-row fade */
+.msg-row.msg-pop-in.mine .msg-bubble.mine {
+  transform-origin: center center;
+  animation: msg-bubble-send-bounce 0.55s cubic-bezier(0.34, 1.45, 0.55, 1);
+}
+
+/* If pop-in is ever used on a received line, keep it subtle */
+.msg-row.msg-pop-in.theirs .msg-bubble.theirs {
+  transform-origin: center center;
+  animation: msg-bubble-soft-in 0.4s ease-out;
+}
+
+@keyframes msg-bubble-send-bounce {
+  0% {
+    opacity: 0.4;
+    transform: translateY(10px) scale(0.9);
+  }
+  50% {
+    opacity: 1;
+    transform: translateY(-6px) scale(1.06);
+  }
+  75% {
+    transform: translateY(3px) scale(0.97);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes msg-bubble-soft-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
 }
 
 .msg-bubble {
@@ -1180,6 +1272,7 @@ main.main-panel {
   display: flex;
   align-items: center;
   gap: 0.35rem;
+  flex-wrap: wrap;
 }
 
 .btn-star {
@@ -1200,6 +1293,49 @@ main.main-panel {
 .btn-star.saved {
   border-color: #fbbf24;
   background: #fffbeb;
+}
+
+/* Save-to-Important: quick bounce on the control + tiny label (different from row pop-in) */
+.btn-star--confirm {
+  animation: star-save-bounce 0.45s ease;
+}
+
+@keyframes star-save-bounce {
+  0% {
+    transform: scale(1);
+  }
+  35% {
+    transform: scale(1.18);
+  }
+  70% {
+    transform: scale(0.96);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+.saved-confirm-chip {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: #86198f;
+  background: linear-gradient(180deg, #fce7f3, #fbcfe8);
+  border: 1px solid #f9a8d4;
+  border-radius: 999px;
+  padding: 0.12rem 0.45rem;
+  animation: saved-chip-in 0.35s ease;
+}
+
+@keyframes saved-chip-in {
+  from {
+    opacity: 0;
+    transform: translateX(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
 }
 
 .msg-row.highlight-msg .msg-bubble {
@@ -1442,6 +1578,218 @@ main.main-panel {
   white-space: nowrap;
 }
 
+/* Catch Up tab + sidebar entry */
+.sidebar-catch-up {
+  margin-bottom: 0.15rem;
+}
+
+.catch-up-sidebar-link {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.55rem 0.7rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: linear-gradient(135deg, #fdf4ff 0%, #fce7f3 100%);
+  text-decoration: none;
+  color: inherit;
+  font-weight: 600;
+  font-size: 0.9rem;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.catch-up-sidebar-link:hover {
+  border-color: #e879f9;
+  box-shadow: var(--shadow);
+}
+
+.catch-up-sidebar-link--active {
+  border-color: #e879f9;
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 1px rgba(232, 121, 249, 0.35);
+}
+
+.catch-up-sidebar-icon {
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.catch-up-sidebar-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.catch-up-page .page-title {
+  margin: 0 0 0.35rem;
+  font-size: 1.35rem;
+  color: #86198f;
+}
+
+.catch-up-page .page-lead {
+  margin: 0 0 1rem;
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.45;
+}
+
+.catch-up-card {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 1.25rem 1.35rem;
+}
+
+.catch-up-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.catch-up-item-wrap {
+  margin-bottom: 0.5rem;
+}
+
+.catch-up-item {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  padding: 0.75rem 1rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: var(--card);
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.catch-up-item:hover {
+  border-color: #e879f9;
+  box-shadow: var(--shadow);
+}
+
+.catch-up-chat {
+  font-weight: 700;
+  font-size: 0.95rem;
+  color: #86198f;
+  margin-bottom: 0.2rem;
+}
+
+.catch-up-from {
+  font-size: 0.76rem;
+  color: var(--muted);
+  margin-bottom: 0.35rem;
+}
+
+.catch-up-preview {
+  font-size: 0.88rem;
+  line-height: 1.4;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.catch-up-empty {
+  list-style: none;
+  padding: 1rem 0.25rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+/* Chat list: pin + unread */
+.chat-item-title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.chat-pin-marker {
+  flex-shrink: 0;
+  font-size: 0.75rem;
+  opacity: 0.85;
+}
+
+.chat-item-meta-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.chat-unread-badge {
+  flex-shrink: 0;
+  min-width: 1.35rem;
+  height: 1.35rem;
+  padding: 0 0.35rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.7rem;
+  font-weight: 800;
+  color: #fff;
+  background: linear-gradient(135deg, #e879f9, #c026d3);
+  border-radius: 999px;
+  box-shadow: 0 1px 4px rgba(192, 38, 211, 0.35);
+}
+
+.chat-row-pin {
+  display: flex;
+  align-items: center;
+}
+
+.btn-pin {
+  flex-shrink: 0;
+  width: 2rem;
+  min-height: 2.25rem;
+  padding: 0;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.btn-pin:hover:not(:disabled) {
+  border-color: var(--line);
+  color: #86198f;
+  background: var(--bg);
+}
+
+.btn-pin:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn-pin-glyph {
+  display: block;
+  transform: translateY(1px);
+}
+
+/* First visit / “new since last read” line inside a thread */
+.unread-messages-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.65rem 0 0.85rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #a21caf;
+}
+
+.unread-messages-divider::before,
+.unread-messages-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #f0abfc, transparent);
+}
+
+.unread-messages-divider span {
+  flex-shrink: 0;
+}
 
 @media (max-width: 800px) {
   .chats-layout {

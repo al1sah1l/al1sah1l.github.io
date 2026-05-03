@@ -34,6 +34,10 @@ export const MessageBubble = {
     // sidebar layout: a bit smaller / tighter
     compact: { type: Boolean, default: false },
     saveDisabled: { type: Boolean, default: false },
+    /** One-shot CSS animation when this row first appears (e.g. after send). Parent clears flag quickly. */
+    popIn: { type: Boolean, default: false },
+    /** Brief pulse + “Saved” chip after starring — parent clears after ~1.5s */
+    saveFlash: { type: Boolean, default: false },
   },
   emits: ["save-message", "open-profile"],
   computed: {
@@ -90,7 +94,11 @@ export const MessageBubble = {
   template: `
   <div
     class="msg-row message-bubble-root"
-    :class="[isMine ? 'mine' : 'theirs', compact && 'message-bubble--compact']"
+    :class="[
+      isMine ? 'mine' : 'theirs',
+      compact && 'message-bubble--compact',
+      popIn && 'msg-pop-in'
+    ]"
     :data-msg-url="message && message.url"
   >
     <div :class="['msg-bubble', isMine ? 'mine' : 'theirs']">
@@ -115,10 +123,11 @@ export const MessageBubble = {
       <button
         type="button"
         class="btn-star"
-        :class="{ saved: isSaved }"
+        :class="{ saved: isSaved, 'btn-star--confirm': saveFlash }"
         :disabled="saveDisabled"
         @click.stop="onSave"
       >{{ isSaved ? "★ Saved" : "☆ Save" }}</button>
+      <span v-if="saveFlash && isSaved" class="saved-confirm-chip" aria-live="polite">Saved</span>
     </div>
   </div>
   `,

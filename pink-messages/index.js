@@ -306,6 +306,13 @@ const joiningDiscoverBusy = ref(false);
 // bump this when Important data changes in other views (lets Important page refresh)
 const importantTick = ref(0);
 
+/** Per-channel last-read timestamp (from personal ChatReadState posts) — drives unread counts + Catch Up */
+const lastReadByChannel = ref(new Map());
+/** Per-channel pin flag (latest PinChat wins) */
+const pinStateByChannel = ref(new Map());
+/** Sidebar unread counts (messages with published > lastRead) */
+const unreadCountByChannel = ref(new Map());
+
 /** @type {import('vue-router').Router} */
 let router = null;
 
@@ -364,9 +371,142 @@ async function loadImportantMarkers() {
   importantByMessageUrl.value = m;
 }
 
+/** Latest ChatReadState per channel — milestone simplified read model */
+async function loadChatReadStates() {
+  if (!session.value) return;
+  const ch = personalInboxChannel(session.value.actor);
+  const objs = await drainDiscover([ch], GRAFFITI_OBJECT_SCHEMA, session.value);
+  const best = new Map();
+  for (const o of objs) {
+    const v = o.value;
+    if (!v || v.activity !== "ChatReadState" || !v.channel) continue;
+    const key = String(v.channel);
+    const lr = Number(v.lastReadPublished || 0);
+    const u = Number(v.updated || v.published || 0);
+    const ex = best.get(key);
+    if (!ex || u >= ex.u) best.set(key, { lr, u });
+  }
+  const out = new Map();
+  for (const [k, v] of best) out.set(k, v.lr);
+  lastReadByChannel.value = out;
+}
+
+/** Latest PinChat per channel */
+async function loadPinStates() {
+  if (!session.value) return;
+  const ch = personalInboxChannel(session.value.actor);
+  const objs = await drainDiscover([ch], GRAFFITI_OBJECT_SCHEMA, session.value);
+  const best = new Map();
+  for (const o of objs) {
+    const v = o.value;
+    if (!v || v.activity !== "PinChat" || !v.channel) continue;
+    const key = String(v.channel);
+    const u = Number(v.updated || v.published || 0);
+    const ex = best.get(key);
+    if (!ex || u >= ex.u) best.set(key, { pinned: !!v.pinned, u });
+  }
+  const out = new Map();
+  for (const [k, v] of best) out.set(k, { pinned: v.pinned, updated: v.u });
+  pinStateByChannel.value = out;
+}
+
+async function refreshUnreadCounts() {
+  const sess = session.value;
+  if (!sess) return;
+  const counts = new Map();
+  for (const row of chatRows.value) {
+    const lr = lastReadByChannel.value.get(row.channel) || 0;
+    try {
+      const objs = await drainDiscover([row.channel], GRAFFITI_OBJECT_SCHEMA, sess);
+      const n = objs.filter(
+        (o) => o.value && o.value.activity === "Send" && (o.value.published || 0) > lr
+      ).length;
+      counts.set(row.channel, n);
+    } catch {
+      counts.set(row.channel, 0);
+    }
+  }
+  unreadCountByChannel.value = counts;
+}
+
+/** Call when user has viewed messages — marks channel read through latest loaded timestamp */
+async function markChannelRead(sessionObj, channel, maxPublished) {
+  if (!sessionObj || !channel) return;
+  const raw = toRaw(sessionObj);
+  const mp = Number(maxPublished || 0);
+  await graffiti.post(
+    JSON.parse(
+      JSON.stringify({
+        channels: [personalInboxChannel(sessionObj.actor)],
+        value: {
+          activity: "ChatReadState",
+          id: crypto.randomUUID(),
+          channel,
+          lastReadPublished: mp,
+          updated: Date.now(),
+        },
+      })
+    ),
+    raw
+  );
+  const nextLR = new Map(lastReadByChannel.value);
+  nextLR.set(channel, mp);
+  lastReadByChannel.value = nextLR;
+  const nextU = new Map(unreadCountByChannel.value);
+  nextU.set(channel, 0);
+  unreadCountByChannel.value = nextU;
+}
+
+async function togglePinChat(sessionObj, row) {
+  if (!sessionObj || !row || !row.channel) return;
+  const raw = toRaw(sessionObj);
+  const nextPinned = !row.pinned;
+  await graffiti.post(
+    JSON.parse(
+      JSON.stringify({
+        channels: [personalInboxChannel(sessionObj.actor)],
+        value: {
+          activity: "PinChat",
+          id: crypto.randomUUID(),
+          channel: row.channel,
+          pinned: nextPinned,
+          updated: Date.now(),
+        },
+      })
+    ),
+    raw
+  );
+  await loadPinStates();
+  await buildChatRows();
+}
+
+/** Aggregate unread Sends across the user’s chats for the Catch Up page (MVP: scan each channel). */
+async function buildCatchUpFeed(sess) {
+  const items = [];
+  for (const row of chatRows.value) {
+    const lr = lastReadByChannel.value.get(row.channel) || 0;
+    const objs = await drainDiscover([row.channel], GRAFFITI_OBJECT_SCHEMA, sess);
+    const unread = objs.filter(
+      (o) => o.value && o.value.activity === "Send" && (o.value.published || 0) > lr
+    );
+    unread.sort((a, b) => (b.value.published || 0) - (a.value.published || 0));
+    for (const o of unread.slice(0, 12)) {
+      items.push({
+        row,
+        message: o,
+        published: o.value.published || 0,
+      });
+    }
+  }
+  items.sort((a, b) => b.published - a.published);
+  return items.slice(0, 80);
+}
+
 async function buildChatRows() {
   if (!session.value) return;
   await loadCreates();
+  await loadChatReadStates();
+  await loadPinStates();
   const joins = await loadJoins();
   const me = session.value.actor;
   const createByChannel = new Map();
@@ -464,8 +604,16 @@ async function buildChatRows() {
       r.folder = "People";
     }
   }
-  list.sort((a, b) => a.title.localeCompare(b.title));
+  for (const r of list) {
+    const ps = pinStateByChannel.value.get(r.channel);
+    r.pinned = !!(ps && ps.pinned);
+  }
+  list.sort((a, b) => {
+    if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+    return a.title.localeCompare(b.title);
+  });
   chatRows.value = list;
+  await refreshUnreadCounts();
 }
 
 /**
@@ -766,6 +914,95 @@ const HomeView = {
 };
 
 /**
+ * One place to skim unread messages across chats (MVP: derived from last-read vs Send timestamps).
+ */
+const CatchUpView = {
+  name: "CatchUpView",
+  inject: ["getSession", "onRouter"],
+  data() {
+    return { busy: false, err: "", items: [] };
+  },
+  computed: {
+    importantVersion() {
+      return importantTick.value;
+    },
+  },
+  watch: {
+    importantVersion() {
+      this.load();
+    },
+    "$route.name"() {
+      if (this.$route.name === "catchUp") this.load();
+    },
+  },
+  async mounted() {
+    await this.load();
+  },
+  methods: {
+    async load() {
+      this.busy = true;
+      this.err = "";
+      const s = this.getSession();
+      if (!s) {
+        this.busy = false;
+        return;
+      }
+      try {
+        await loadEverything();
+        this.items = await buildCatchUpFeed(s);
+        const actors = [...new Set(this.items.map((it) => this.senderActor(it.message)).filter(Boolean))];
+        await ensureProfiles(actors);
+      } catch (e) {
+        this.err = (e && e.message) || String(e);
+      } finally {
+        this.busy = false;
+      }
+    },
+    senderActor(m) {
+      return (m.value && m.value.actor) || m.actor || "";
+    },
+    senderName(m) {
+      const a = this.senderActor(m);
+      return publicDisplayLine(profileCache[a] || null);
+    },
+    preview(m) {
+      const t = (m.value && m.value.content) || "";
+      return t.length > 140 ? t.slice(0, 137) + "…" : t;
+    },
+    openItem(it) {
+      this.onRouter().push({
+        name: "chat",
+        params: { chatId: routeIdFromChannel(it.row.channel) },
+        query: it.message && it.message.url ? { highlight: it.message.url } : {},
+      });
+    },
+    fmt(ts) {
+      return formatTime(ts);
+    },
+  },
+  template: `
+  <div class="main-page-full catch-up-page">
+    <div class="main-page-inner card catch-up-card">
+      <h1 class="page-title">Catch Up</h1>
+      <p class="page-lead">Unread messages from your chats, newest first — tap a row to open the thread.</p>
+      <p v-if="busy" class="inline-status">Loading…</p>
+      <p v-if="err" class="error-msg" role="alert">{{ err }}</p>
+      <ul v-else class="catch-up-list" role="list">
+        <li v-for="(it, i) in items" :key="it.message.url + '-' + i" class="catch-up-item-wrap">
+          <button type="button" class="catch-up-item card" @click="openItem(it)">
+            <div class="catch-up-chat">{{ it.row.title }}</div>
+            <div class="catch-up-from">{{ senderName(it.message) }} · {{ fmt(it.published) }}</div>
+            <div class="catch-up-preview">{{ preview(it.message) }}</div>
+          </button>
+        </li>
+        <li v-if="!busy && items.length === 0" class="catch-up-empty">You’re all caught up — no unread messages.</li>
+      </ul>
+    </div>
+  </div>
+  `,
+};
+
+/**
  * Full-page Explore: profile search (client-side), start a 1:1, create a group (modal from shell), join public invites.
  * Renders in the main panel on `/explore` so it feels like a real page, not only a sidebar.
  */
@@ -1016,6 +1253,14 @@ const ChatView = {
       sendBusy: false,
       impBusy: false,
       loadBusy: false,
+      /** True only when switching chats — drives skeleton (poll/send refresh stays soft). */
+      chatSwitchLoading: false,
+      /** message id (value.id) — one-shot pop-in; keyed by id so optimistic + server row share the same key. */
+      popInMessageIds: {},
+      /** URL → show brief “Saved” chip after starring (cleared after short timeout). */
+      saveFlashUrls: {},
+      /** Index of first message newer than last-read when opening a chat (divider line); -1 = none */
+      unreadDividerIndex: -1,
       poller: null,
     };
   },
@@ -1031,12 +1276,8 @@ const ChatView = {
       },
       immediate: false,
     },
-    $route: {
-      handler() {
-        this.hydrate();
-        this.$nextTick(() => this.scrollHighlight());
-      },
-      deep: true,
+    "$route.query.highlight"() {
+      this.$nextTick(() => this.scrollHighlight());
     },
   },
   methods: {
@@ -1055,13 +1296,25 @@ const ChatView = {
       const actor = this.senderId(m);
       return profileCache[actor] != null ? profileCache[actor] : null;
     },
-    async hydrate() {
+    /**
+     * Load messages for the current chat.
+     * @param {{ soft?: boolean }} opts — soft=true = refresh in place (poll / after send / Important); no skeleton.
+     */
+    async hydrate(opts = {}) {
+      const soft = opts.soft === true;
       this.err = "";
       const r = this.row();
       if (!r) {
         this.messages = [];
+        this.chatSwitchLoading = false;
+        this.unreadDividerIndex = -1;
         this.err = "That chat is not in your list — try Home or Discover first.";
         return;
+      }
+      const priorLastRead = lastReadByChannel.value.get(r.channel) || 0;
+      if (!soft) {
+        this.messages = [];
+        this.chatSwitchLoading = true;
       }
       this.loadBusy = true;
       globalStatus.value = "Loading chat…";
@@ -1073,14 +1326,45 @@ const ChatView = {
           .filter((o) => o.value && o.value.activity === "Send")
           .sort((a, b) => (a.value.published || 0) - (b.value.published || 0));
         await ensureProfiles(this.messages.map((m) => this.senderId(m)));
+        if (!soft) {
+          this.unreadDividerIndex = this.messages.findIndex(
+            (m) => ((m.value && m.value.published) || 0) > priorLastRead
+          );
+          if (this.unreadDividerIndex < 0) this.unreadDividerIndex = -1;
+        } else {
+          this.unreadDividerIndex = -1;
+        }
+        const maxPub = this.messages.reduce((acc, o) => Math.max(acc, (o.value && o.value.published) || 0), 0);
+        if (this.sess && r.channel) {
+          await markChannelRead(toRaw(this.sess), r.channel, maxPub);
+        }
         this.$nextTick(() => this.scrollHighlight());
       } catch (e) {
         console.error(e);
         this.err = "Could not load messages.";
       } finally {
         this.loadBusy = false;
+        this.chatSwitchLoading = false;
         globalStatus.value = "";
       }
+    },
+    /** One-shot pop-in: clear after the bounce CSS finishes so re-renders don’t replay. */
+    scheduleClearPopInId(id) {
+      if (!id) return;
+      window.setTimeout(() => {
+        const next = { ...this.popInMessageIds };
+        delete next[id];
+        this.popInMessageIds = next;
+      }, 620);
+    },
+    /** Brief “Saved” chip next to the star after a successful save-to-Important. */
+    scheduleClearSaveFlash(url) {
+      if (!url) return;
+      window.setTimeout(() => {
+        const next = { ...this.saveFlashUrls };
+        delete next[url];
+        this.saveFlashUrls = next;
+      }, 1600);
     },
     scrollHighlight() {
       const q = this.$route.query.highlight;
@@ -1116,26 +1400,64 @@ const ChatView = {
       this.sendBusy = true;
       this.err = "";
       globalStatus.value = "Sending…";
+      const msgId = crypto.randomUUID();
+      const published = Date.now();
+      // Optimistic row: bounce can start before Graffiti returns (same id → smooth handoff to real object).
+      const optimistic = {
+        url: `pending:${msgId}`,
+        actor: this.sess.actor,
+        value: {
+          activity: "Send",
+          type: "Message",
+          id: msgId,
+          content: t,
+          chatChannel: r.channel,
+          chatTitle: r.title,
+          actor: this.sess.actor,
+          published,
+        },
+      };
+      this.messages = [...this.messages, optimistic].sort(
+        (a, b) => (a.value.published || 0) - (b.value.published || 0)
+      );
+      this.popInMessageIds = { ...this.popInMessageIds, [msgId]: true };
+      this.scheduleClearPopInId(msgId);
       try {
-        await graffiti.post(
+        await this.$nextTick();
+        const box = this.$refs.scrollBox;
+        if (box) box.scrollTop = box.scrollHeight;
+        // Yield so the first paint + CSS bounce start before the network call blocks the main thread.
+        await new Promise((resolve) => setTimeout(resolve, 110));
+        const posted = await graffiti.post(
           {
             channels: [r.channel],
             value: {
               activity: "Send",
               type: "Message",
-              id: crypto.randomUUID(),
+              id: msgId,
               content: t,
               chatChannel: r.channel,
               chatTitle: r.title,
               actor: this.sess.actor,
-              published: Date.now(),
+              published,
             },
           },
           this.sess
         );
+        const idx = this.messages.findIndex((m) => m.value && m.value.id === msgId);
+        if (idx >= 0 && posted) {
+          // Same value.id as optimistic → v-for key stays stable → one smooth bounce, no flash swap.
+          this.messages.splice(idx, 1, posted);
+        }
         if (this.$refs.ta) this.$refs.ta.value = "";
-        await this.hydrate();
+        // Tiny gap before re-fetch so the bubble update doesn’t race the same frame as hydrate.
+        await new Promise((resolve) => setTimeout(resolve, 45));
+        await this.hydrate({ soft: true });
       } catch (e) {
+        this.messages = this.messages.filter((m) => !(m.value && m.value.id === msgId));
+        const next = { ...this.popInMessageIds };
+        delete next[msgId];
+        this.popInMessageIds = next;
         this.err = "Send failed: " + e.message;
       } finally {
         this.sendBusy = false;
@@ -1175,8 +1497,10 @@ const ChatView = {
           const next2 = new Map(importantByMessageUrl.value);
           next2.set(o.url, { importantUrl: posted.url });
           importantByMessageUrl.value = next2;
+          this.saveFlashUrls = { ...this.saveFlashUrls, [o.url]: true };
+          this.scheduleClearSaveFlash(o.url);
         }
-        await this.hydrate();
+        await this.hydrate({ soft: true });
         importantTick.value++;
       } catch (e) {
         this.err = "Could not update saved: " + e.message;
@@ -1205,19 +1529,45 @@ const ChatView = {
           @click="askRemoveChatFromChatView(row())"
         >⋯</button>
       </div>
-      <p v-if="loadBusy" class="inline-status" style="padding:0.75rem 1rem 0">Loading messages…</p>
       <div class="messages-area" ref="scrollBox">
-        <message-bubble
-          v-for="(o, idx) in messages"
-          :key="o.url + (o.value && o.value.id ? o.value.id : String(idx))"
-          :message="o"
-          :sender-profile="senderProfileFor(o)"
-          :is-mine="!!sess && senderId(o) === sess.actor"
-          :is-saved="isImportantUrl(o.url)"
-          :save-disabled="impBusy"
-          @open-profile="goProfile($event)"
-          @save-message="onToggleImportant"
-        />
+        <!-- Skeleton only when opening/switching chats — avoids flashing on background refresh -->
+        <div
+          v-if="chatSwitchLoading && loadBusy"
+          class="chat-skeleton"
+          aria-busy="true"
+          aria-label="Loading messages"
+        >
+          <div
+            v-for="n in 5"
+            :key="'sk-' + n"
+            class="chat-skeleton-row"
+            :class="n % 2 === 0 ? 'chat-skeleton-row--theirs' : 'chat-skeleton-row--mine'"
+          >
+            <div class="chat-skeleton-bubble" :class="'chat-skeleton-bubble--s' + ((n % 3) + 1)"></div>
+          </div>
+        </div>
+        <template v-else>
+          <template v-for="(o, idx) in messages" :key="(o.value && o.value.id) || o.url + String(idx)">
+            <div
+              v-if="unreadDividerIndex >= 0 && idx === unreadDividerIndex"
+              class="unread-messages-divider"
+              role="separator"
+            >
+              <span>New since you last read</span>
+            </div>
+            <message-bubble
+              :message="o"
+              :sender-profile="senderProfileFor(o)"
+              :is-mine="!!sess && senderId(o) === sess.actor"
+              :is-saved="isImportantUrl(o.url)"
+              :save-disabled="impBusy"
+              :pop-in="!!(o.value && o.value.id && popInMessageIds[o.value.id])"
+              :save-flash="!!saveFlashUrls[o.url]"
+              @open-profile="goProfile($event)"
+              @save-message="onToggleImportant"
+            />
+          </template>
+        </template>
       </div>
       <p v-if="err" class="error-msg" role="alert">{{ err }}</p>
       <form class="composer" v-if="row()" @submit.prevent="onSend">
@@ -1243,11 +1593,11 @@ const ChatView = {
     this.hydrate();
     this.poller = window.setInterval(() => {
       if (this.$route.name !== "chat" || this.$route.params.chatId !== this.chatId) return;
-      this.hydrate();
+      this.hydrate({ soft: true });
     }, 12000);
     this._onFocus = () => {
       if (this.$route.name === "chat" && this.$route.params.chatId === this.chatId) {
-        this.hydrate();
+        this.hydrate({ soft: true });
       }
     };
     window.addEventListener("focus", this._onFocus);
@@ -1716,11 +2066,21 @@ const MainLayout = {
     },
     chatsTabActive() {
       const n = this.$route.name;
+      if (n === "catchUp") return false;
       const fromImp = String(this.$route.query.from || "") === "important";
       // “Chats” tab = normal list + chat only when we didn’t open the thread from Important
       if (n === "home") return true;
       if (n === "chat" && !fromImp) return true;
       return false;
+    },
+    catchUpTabActive() {
+      return this.$route.name === "catchUp";
+    },
+    /** Total unread across all sidebar chats (for Catch Up entry badge). */
+    catchUpTotalUnread() {
+      let t = 0;
+      for (const n of unreadCountByChannel.value.values()) t += n;
+      return t;
     },
     exploreTabActive() {
       return this.$route.name === "explore";
@@ -1871,6 +2231,23 @@ const MainLayout = {
     channelToRouteId(ch) {
       return routeIdFromChannel(ch);
     },
+    unreadFor(ch) {
+      return unreadCountByChannel.value.get(ch) || 0;
+    },
+    async onTogglePin(row) {
+      if (this.removeBusy) return;
+      const s = this.session;
+      if (!s) return;
+      this.listRemoveErr = "";
+      globalStatus.value = row.pinned ? "Unpinning…" : "Pinning…";
+      try {
+        await togglePinChat(s, row);
+      } catch (e) {
+        this.listRemoveErr = (e && e.message) || String(e);
+      } finally {
+        globalStatus.value = "";
+      }
+    },
   },
   template: `
   <div id="app-screen" class="screen">
@@ -1899,6 +2276,12 @@ const MainLayout = {
           @click="(e) => navigate(e)"
         >Chats</a>
       </router-link>
+      <router-link
+        :to="{ name: 'catchUp' }"
+        class="tab"
+        :class="{ active: catchUpTabActive }"
+        active-class="active"
+      >Catch Up</router-link>
       <router-link
         to="/explore"
         class="tab"
@@ -1930,6 +2313,18 @@ const MainLayout = {
               </div>
             </div>
 
+            <div class="sidebar-section sidebar-catch-up">
+              <router-link
+                :to="{ name: 'catchUp' }"
+                class="catch-up-sidebar-link"
+                :class="{ 'catch-up-sidebar-link--active': catchUpTabActive }"
+              >
+                <span class="catch-up-sidebar-icon" aria-hidden="true">✨</span>
+                <span class="catch-up-sidebar-text">Catch Up</span>
+                <span v-if="catchUpTotalUnread > 0" class="chat-unread-badge">{{ catchUpTotalUnread > 99 ? '99+' : catchUpTotalUnread }}</span>
+              </router-link>
+            </div>
+
             <div class="sidebar-section flex-grow">
               <div class="section-label">Your chats</div>
               <p v-if="listRemoveErr" class="error-msg" role="alert">{{ listRemoveErr }}</p>
@@ -1941,9 +2336,28 @@ const MainLayout = {
                     class="chat-item"
                     active-class="selected"
                   >
-                    <span class="chat-item-title">{{ r.title }}</span>
-                    <span class="chat-item-meta">{{ r.folder }}</span>
+                    <span class="chat-item-title-row">
+                      <span v-if="r.pinned" class="chat-pin-marker" title="Pinned">📌</span>
+                      <span class="chat-item-title">{{ r.title }}</span>
+                    </span>
+                    <span class="chat-item-meta-row">
+                      <span class="chat-item-meta">{{ r.folder }}</span>
+                      <span v-if="unreadFor(r.channel) > 0" class="chat-unread-badge" aria-label="Unread messages">{{
+                        unreadFor(r.channel) > 99 ? '99+' : unreadFor(r.channel)
+                      }}</span>
+                    </span>
                   </router-link>
+                  <div class="chat-row-pin">
+                    <button
+                      type="button"
+                      class="btn-pin"
+                      :title="r.pinned ? 'Unpin chat' : 'Pin chat'"
+                      :disabled="removeBusy"
+                      @click.prevent="onTogglePin(r)"
+                    >
+                      <span class="btn-pin-glyph" aria-hidden="true">{{ r.pinned ? '📌' : '📍' }}</span>
+                    </button>
+                  </div>
                   <div class="chat-row-more" v-if="r.joinUrl || (r.source === 'create' && r.createUrl)">
                     <button
                       type="button"
@@ -2107,6 +2521,7 @@ const routes = [
     component: MainLayout,
     children: [
       { path: "", name: "home", component: HomeView, meta: { title: "Home" } },
+      { path: "catch-up", name: "catchUp", component: CatchUpView, meta: { title: "Catch Up" } },
       { path: "chat/:chatId", name: "chat", component: ChatView, props: true, meta: { title: "Chat" } },
       { path: "explore", name: "explore", component: ExplorePageView, meta: { title: "Explore" } },
       { path: "important", name: "important", component: MainEmptyView, meta: { title: "Important" } },
