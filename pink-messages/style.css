@@ -14,6 +14,9 @@
   --shadow: 0 4px 20px rgba(192, 38, 211, 0.12);
   --radius: 14px;
   --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  /* Align header rows (tabs, status) with the centered main column / sidebar */
+  --app-shell-max: 1320px;
+  --app-shell-pad-x: 1rem;
 }
 
 *,
@@ -168,13 +171,67 @@ a.header-link:hover {
   white-space: nowrap;
 }
 
-.tab-bar {
+/* Header: avatar + @username → profile */
+.header-account-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.15rem 0.45rem 0.15rem 0.15rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  text-decoration: none;
+  color: inherit;
+  max-width: min(14rem, 38vw);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.header-account-chip:hover {
+  border-color: var(--line);
+  background: rgba(255, 255, 255, 0.65);
+}
+
+.header-account-avatar {
+  width: 2rem;
+  height: 2rem;
+  border-radius: 999px;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+.header-account-avatar.ph {
   display: flex;
-  gap: 0.35rem;
-  padding: 0.65rem 1rem 0;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.85rem;
+  font-weight: 700;
+  background: var(--accent-soft);
+  color: #86198f;
+}
+
+.header-account-handle {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-bar {
   background: rgba(255, 255, 255, 0.5);
   border-bottom: 1px solid var(--line);
+}
+
+.tab-bar-inner {
+  display: flex;
+  gap: 0.35rem;
+  padding: 0.65rem var(--app-shell-pad-x) 0;
   flex-wrap: wrap;
+  max-width: var(--app-shell-max);
+  width: 100%;
+  margin-left: auto;
+  margin-right: auto;
+  box-sizing: border-box;
 }
 
 .tab {
@@ -212,19 +269,32 @@ a.tab {
 }
 
 .global-status {
-  margin: 0;
-  padding: 0.35rem 1rem;
+  margin: 0 auto;
+  padding: 0.35rem var(--app-shell-pad-x);
   font-size: 0.85rem;
   color: #86198f;
   min-height: 1.5rem;
+  box-sizing: border-box;
+  max-width: var(--app-shell-max);
+  width: 100%;
+}
+
+.global-status:empty {
+  padding-top: 0;
+  padding-bottom: 0;
+  min-height: 0;
 }
 
 .app-layout {
   flex: 1 1 0;
   min-height: 0;
-  padding: 0 1rem 1rem;
+  padding: 0 var(--app-shell-pad-x) 1rem;
   display: flex;
   flex-direction: column;
+  max-width: var(--app-shell-max);
+  margin: 0 auto;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .card {
@@ -308,6 +378,19 @@ a.tab {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+.sidebar-embed.catch-up-page .catch-up-sidebar-chat {
+  font-weight: 600;
+  font-size: 0.88rem;
+  color: #86198f;
+  margin-bottom: 0.12rem;
+}
+
+.sidebar-embed.catch-up-page .catch-up-sidebar-meta {
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
 }
 
 /* Stack explore cards in the narrow column: avatar+text row, then buttons */
@@ -424,6 +507,62 @@ a.tab {
   font-weight: 600;
 }
 
+.folder-pill--custom {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding-right: 0.45rem;
+  max-width: 100%;
+}
+
+.folder-pill-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 9rem;
+}
+
+.folder-pill-remove {
+  flex-shrink: 0;
+  width: 1.35rem;
+  height: 1.35rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  font-size: 1.1rem;
+  line-height: 1;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.folder-pill-remove:hover {
+  color: #9d174d;
+  background: rgba(253, 242, 248, 0.9);
+}
+
+.folder-custom-add {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+}
+
+.folder-custom-input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.35rem 0.5rem;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  font: inherit;
+  font-size: 0.85rem;
+}
+
+.folder-custom-err {
+  margin: 0.35rem 0 0;
+  font-size: 0.78rem;
+}
+
 .sidebar-actions {
   display: flex;
   flex-direction: column;
@@ -494,6 +633,18 @@ a.tab {
   flex: 1;
 }
 
+/* Default split applies to discover panels + generic lists only — sidebar pins its own rules below */
+.sidebar-section.flex-grow .chat-list--pinned-section {
+  flex: 0 0 auto;
+  overflow-y: visible;
+}
+
+.sidebar-section.flex-grow .chat-list:not(.chat-list--pinned-section) {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+}
+
 .discover-list li,
 .chat-list li {
   margin-bottom: 0.35rem;
@@ -531,6 +682,9 @@ a.chat-item {
 .chat-item-title {
   font-weight: 600;
   font-size: 0.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chat-item-meta {
@@ -804,6 +958,9 @@ main.main-panel {
 .explore-line1 {
   font-weight: 600;
   color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .explore-line2 {
@@ -952,6 +1109,7 @@ main.main-panel {
 .chat-title {
   margin: 0;
   font-size: 1.2rem;
+  overflow-wrap: anywhere;
 }
 
 .folder-badge {
@@ -964,7 +1122,7 @@ main.main-panel {
 
 .messages-area {
   flex: 1 1 0;
-  min-height: 0;
+  min-height: min(52vh, 26rem);
   overflow-y: auto;
   padding: 1rem;
   display: flex;
@@ -1166,6 +1324,17 @@ main.main-panel {
   font-size: 0.92rem;
   line-height: 1.45;
   word-break: break-word;
+}
+
+.msg-body-line .msg-link {
+  color: #a21caf;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  word-break: break-all;
+}
+
+.msg-body-line .msg-link:hover {
+  color: #86198f;
 }
 
 /* Reusable <MessageBubble>: second line for @ when we have a real name, optional chat label */
@@ -1789,6 +1958,131 @@ main.main-panel {
 
 .unread-messages-divider span {
   flex-shrink: 0;
+}
+
+/* Sidebar ⋯ menu */
+.chat-actions-wrap {
+  position: relative;
+  flex-shrink: 0;
+  align-self: stretch;
+  display: flex;
+  align-items: stretch;
+}
+
+.chat-actions-menu {
+  position: absolute;
+  right: 0;
+  top: 100%;
+  margin-top: 2px;
+  z-index: 40;
+  min-width: 11.5rem;
+  padding: 0.35rem 0;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  box-shadow: var(--shadow);
+}
+
+.chat-actions-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 0.45rem 0.85rem;
+  border: none;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+  color: var(--text);
+}
+
+.chat-actions-menu-item:hover {
+  background: var(--bg);
+}
+
+.chat-actions-menu-item--danger {
+  color: #9d174d;
+}
+
+.sidebar-micro-label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #a21caf;
+  margin: 0.35rem 0 0.25rem;
+}
+
+.sidebar-micro-label--spaced {
+  margin-top: 0.85rem;
+}
+
+.chat-list--pinned-section {
+  margin-bottom: 0.25rem;
+}
+
+.chat-list-item--pinned .chat-item {
+  background: linear-gradient(135deg, #fffefb 0%, #fdf4ff 100%);
+  border-color: #f9a8d4;
+}
+
+.chat-list--after-pinned {
+  margin-top: 0.15rem;
+}
+
+.explore-section {
+  margin-bottom: 1rem;
+}
+
+.explore-section--groups {
+  padding-top: 0.25rem;
+  border-top: 1px dashed var(--line);
+}
+
+.join-row--card {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.45rem;
+  padding: 0.65rem 0.75rem !important;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: linear-gradient(180deg, #faf5ff 0%, #fff 100%);
+}
+
+.join-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.join-row-title {
+  font-weight: 600;
+  font-size: 0.92rem;
+  overflow-wrap: anywhere;
+}
+
+.join-row-folder {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+/* Group create modal */
+.modal-lead {
+  margin: -0.25rem 0 1rem;
+  font-size: 0.88rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.profile-actor-muted {
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin: 0.35rem 0 0;
+}
+
+.profile-actor-muted code {
+  font-size: 0.68rem;
+  word-break: break-all;
 }
 
 @media (max-width: 800px) {

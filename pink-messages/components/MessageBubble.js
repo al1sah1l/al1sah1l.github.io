@@ -20,6 +20,15 @@ function localFormatTime(ts) {
   }
 }
 
+/** First letter for avatar fallback — skips leading @ so “@sam” → S, not @ */
+function initialFromDisplayLabel(label) {
+  if (!label || typeof label !== "string") return "";
+  let s = label.trim();
+  if (s.startsWith("@")) s = s.slice(1).trim();
+  if (!s) return "";
+  return s.charAt(0).toUpperCase();
+}
+
 export const MessageBubble = {
   name: "MessageBubble",
   props: {
@@ -68,15 +77,42 @@ export const MessageBubble = {
       return "@" + String(p.username).replace(/^@/, "");
     },
     avatarInitial() {
-      if (this.primaryName && this.primaryName !== "Someone" && this.primaryName !== "You") {
-        return this.primaryName.charAt(0).toUpperCase();
+      // Own messages: primaryName is "You" — still use real name / username for the glyph (not actor id).
+      if (this.isMine) {
+        const p = this.senderProfile;
+        if (p) {
+          const full = [p.firstName, p.lastName].filter(Boolean).join(" ").trim();
+          if (full) return initialFromDisplayLabel(full);
+          if (p.username) return initialFromDisplayLabel(String(p.username));
+        }
+        return "Y";
       }
-      return (this.senderActor || "?").charAt(0).toUpperCase();
+      if (this.primaryName && this.primaryName !== "Someone") {
+        return initialFromDisplayLabel(this.primaryName) || "?";
+      }
+      // No profile yet — avoid actor id (random first letter); show neutral until load completes.
+      return "?";
     },
     bodyText() {
       const m = this.message;
       if (!m || !m.value) return "";
       return m.value.content != null ? m.value.content : "";
+    },
+    /** Split text and http(s) links for simple, safe linkification (no full HTML). */
+    bodyChunks() {
+      const raw = this.bodyText || "";
+      const re = /(https?:\/\/[^\s<]+)/gi;
+      const out = [];
+      let last = 0;
+      let m;
+      while ((m = re.exec(raw)) !== null) {
+        if (m.index > last) out.push({ link: false, text: raw.slice(last, m.index) });
+        out.push({ link: true, text: m[0] });
+        last = m.index + m[0].length;
+      }
+      if (last < raw.length) out.push({ link: false, text: raw.slice(last) });
+      if (out.length === 0) out.push({ link: false, text: raw });
+      return out;
     },
     timeLine() {
       if (!this.message || !this.message.value) return "";
@@ -117,7 +153,19 @@ export const MessageBubble = {
           <span>{{ timeLine }}</span>
         </span>
       </div>
-      <div class="msg-body-line">{{ bodyText }}</div>
+      <div class="msg-body-line">
+        <template v-for="(chunk, ci) in bodyChunks" :key="'c' + ci">
+          <a
+            v-if="chunk.link"
+            :href="chunk.text"
+            class="msg-link"
+            target="_blank"
+            rel="noopener noreferrer"
+            @click.stop
+          >{{ chunk.text }}</a>
+          <span v-else class="msg-text-part">{{ chunk.text }}</span>
+        </template>
+      </div>
     </div>
     <div class="msg-actions">
       <button

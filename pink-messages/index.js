@@ -37,6 +37,50 @@ function routeIdFromChannel(channel) {
   return channel.split("/").pop() || channel;
 }
 
+/** Reserved names for built-in + removed “Verification” — custom folders may not reuse these. */
+const RESERVED_FOLDER_NAMES = new Set(["all", "people", "groups", "verification"]);
+
+const CUSTOM_FOLDERS_LS_PREFIX = "pink-messages-custom-folders-v1";
+
+function customFoldersStorageKey(actor) {
+  return `${CUSTOM_FOLDERS_LS_PREFIX}:${actor}`;
+}
+
+/** Per-actor list of extra folder names (client-only; group folder is still stored on Graffiti when you assign a chat). */
+function loadCustomFolderNames(actor) {
+  if (!actor) return [];
+  try {
+    const raw = localStorage.getItem(customFoldersStorageKey(actor));
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    const seen = new Set();
+    const out = [];
+    for (const x of arr) {
+      const name = String(x || "").trim().slice(0, 40);
+      if (!name) continue;
+      const low = name.toLowerCase();
+      if (RESERVED_FOLDER_NAMES.has(low)) continue;
+      if (seen.has(low)) continue;
+      seen.add(low);
+      out.push(name);
+      if (out.length >= 32) break;
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function saveCustomFolderNames(actor, names) {
+  if (!actor || !Array.isArray(names)) return;
+  try {
+    localStorage.setItem(customFoldersStorageKey(actor), JSON.stringify(names));
+  } catch (e) {
+    console.warn("Could not save custom folders", e);
+  }
+}
+
 /**
  * Single string to feed GraffitiMediaImg (or save): Graffiti media URL from postMedia in photoUrl,
  * legacy https in photoURL, or legacy inline data URL in photoData.
@@ -211,6 +255,7 @@ async function runCreateGroupAndGo(sessionObj, { title, folder, onRoutePush }) {
     sessionObj
   );
   await loadEverything();
+  await Promise.resolve();
   if (onRoutePush) onRoutePush({ name: "chat", params: { chatId: routeIdFromChannel(channel) } });
 }
 
@@ -224,6 +269,7 @@ async function runStartDirectMessage(sessionObj, { otherActor, labelTitle, onRou
   }
   const ex = findDirectChatForPeer(otherActor);
   if (ex) {
+    await Promise.resolve();
     if (onRoutePush) onRoutePush({ name: "chat", params: { chatId: routeIdFromChannel(ex.channel) } });
     return;
   }
@@ -262,6 +308,7 @@ async function runStartDirectMessage(sessionObj, { otherActor, labelTitle, onRou
     sessionObj
   );
   await loadEverything();
+  await Promise.resolve();
   if (onRoutePush) onRoutePush({ name: "chat", params: { chatId: routeIdFromChannel(channel) } });
 }
 
@@ -457,10 +504,10 @@ async function markChannelRead(sessionObj, channel, maxPublished) {
   unreadCountByChannel.value = nextU;
 }
 
-async function togglePinChat(sessionObj, row) {
+/** Persist pin state (server); callers handle optimistic UI + sorting locally. */
+async function persistPinChat(sessionObj, row, pinnedBool) {
   if (!sessionObj || !row || !row.channel) return;
   const raw = toRaw(sessionObj);
-  const nextPinned = !row.pinned;
   await graffiti.post(
     JSON.parse(
       JSON.stringify({
@@ -469,7 +516,7 @@ async function togglePinChat(sessionObj, row) {
           activity: "PinChat",
           id: crypto.randomUUID(),
           channel: row.channel,
-          pinned: nextPinned,
+          pinned: !!pinnedBool,
           updated: Date.now(),
         },
       })
@@ -477,7 +524,13 @@ async function togglePinChat(sessionObj, row) {
     raw
   );
   await loadPinStates();
-  await buildChatRows();
+}
+
+function sortChatRowsByPinThenTitle(list) {
+  return [...list].sort((a, b) => {
+    if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+    return (a.title || "").localeCompare(b.title || "");
+  });
 }
 
 /** Aggregate unread Sends across the user’s chats for the Catch Up page (MVP: scan each channel). */
@@ -595,6 +648,17 @@ async function buildChatRows() {
     if (rScore > exScore) byPeer.set(r.otherActor, r);
   }
   list = keep.concat(Array.from(byPeer.values()));
+  // Normalize folders for sidebar filters. Legacy “Verification” → Groups (folder removed from product).
+  for (const r of list) {
+    const ov = chatMetaOverrides.value.get(String(r.channel || ""));
+    if (r.chatKind === "direct") {
+      r.folder = "People";
+    } else {
+      let f = (ov && ov.folder) || r.folder;
+      if (f === "Verification") f = "Groups";
+      r.folder = f || "Groups";
+    }
+  }
   const directPeers = Array.from(new Set(list.filter((r) => r.chatKind === "direct" && r.otherActor).map((r) => r.otherActor)));
   if (directPeers.length > 0) {
     await ensureProfiles(directPeers);
@@ -608,11 +672,7 @@ async function buildChatRows() {
     const ps = pinStateByChannel.value.get(r.channel);
     r.pinned = !!(ps && ps.pinned);
   }
-  list.sort((a, b) => {
-    if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
-    return a.title.localeCompare(b.title);
-  });
-  chatRows.value = list;
+  chatRows.value = sortChatRowsByPinThenTitle(list);
   await refreshUnreadCounts();
 }
 
@@ -648,9 +708,10 @@ async function removeMyJoinFromList(sessionObj, row) {
   }
 }
 
-async function updateMyChatMetadata(sessionObj, row, { title, folder }) {
+async function updateMyChatMetadata(sessionObj, row, { title, folder }, options = {}) {
   if (!sessionObj) return;
   if (!row) throw new Error("Chat row missing.");
+  const skipReload = options.skipReload === true;
   const raw = toRaw(sessionObj);
   const t = String(title || "").trim();
   if (!t) throw new Error("Chat name cannot be empty.");
@@ -681,7 +742,7 @@ async function updateMyChatMetadata(sessionObj, row, { title, folder }) {
       if (r.channel !== row.channel) return r;
       return { ...r, title: t, folder: f };
     });
-    await loadEverything();
+    if (!skipReload) await loadEverything();
     return;
   }
 
@@ -714,7 +775,31 @@ async function updateMyChatMetadata(sessionObj, row, { title, folder }) {
     if (r.channel !== row.channel) return r;
     return { ...r, title: nextJoin.title, folder: nextJoin.folder };
   });
+  if (!skipReload) await loadEverything();
+}
+
+/** Before removing a custom folder name, move every chat in that folder (groups → Groups, directs → People). */
+async function reassignChatsFromDeletedFolder(sessionObj, folderName) {
+  if (!sessionObj || !folderName) return;
+  const targets = chatRows.value.filter((r) => r && r.folder === folderName);
+  if (targets.length === 0) return;
+  let lastErr = null;
+  for (const row of targets) {
+    try {
+      const dest = row.chatKind === "direct" ? "People" : "Groups";
+      await updateMyChatMetadata(
+        sessionObj,
+        row,
+        { title: row.title, folder: dest },
+        { skipReload: true }
+      );
+    } catch (e) {
+      lastErr = e;
+      console.warn("Could not move chat out of deleted folder", row.channel, e);
+    }
+  }
   await loadEverything();
+  if (lastErr) throw lastErr;
 }
 
 async function deleteGroupForEveryone(sessionObj, row) {
@@ -804,7 +889,10 @@ async function joinDiscoverChat(obj, onRoutePush) {
     await graffiti.post(JSON.parse(JSON.stringify(doc)), toRaw(s));
     setDiscoverStatus("Joined!");
     await loadEverything();
-    if (onRoutePush) onRoutePush({ name: "chat", params: { chatId: routeIdFromChannel(String(v.channel)) } });
+    // Let Vue apply chatRows before navigating — avoids a one-frame “missing chat” blank state.
+    await Promise.resolve();
+    if (onRoutePush)
+      onRoutePush({ name: "chat", params: { chatId: routeIdFromChannel(String(v.channel)) } });
   } catch (e) {
     setDiscoverStatus("Join failed: " + (e && e.message ? e.message : String(e)));
   } finally {
@@ -931,9 +1019,6 @@ const CatchUpView = {
     importantVersion() {
       this.load();
     },
-    "$route.name"() {
-      if (this.$route.name === "catchUp") this.load();
-    },
   },
   async mounted() {
     await this.load();
@@ -970,10 +1055,12 @@ const CatchUpView = {
       return t.length > 140 ? t.slice(0, 137) + "…" : t;
     },
     openItem(it) {
+      const q = { from: "catchup" };
+      if (it.message && it.message.url) q.highlight = it.message.url;
       this.onRouter().push({
         name: "chat",
         params: { chatId: routeIdFromChannel(it.row.channel) },
-        query: it.message && it.message.url ? { highlight: it.message.url } : {},
+        query: q,
       });
     },
     fmt(ts) {
@@ -981,21 +1068,21 @@ const CatchUpView = {
     },
   },
   template: `
-  <div class="main-page-full catch-up-page">
-    <div class="main-page-inner card catch-up-card">
+  <div class="sidebar-embed catch-up-page" aria-label="Catch Up">
+    <div class="sidebar-embed-scroll catch-up-inner">
       <h1 class="page-title">Catch Up</h1>
-      <p class="page-lead">Unread messages from your chats, newest first — tap a row to open the thread.</p>
+      <p class="page-lead">Unread messages, newest first — tap a row to open the thread here on the right.</p>
       <p v-if="busy" class="inline-status">Loading…</p>
       <p v-if="err" class="error-msg" role="alert">{{ err }}</p>
-      <ul v-else class="catch-up-list" role="list">
-        <li v-for="(it, i) in items" :key="it.message.url + '-' + i" class="catch-up-item-wrap">
-          <button type="button" class="catch-up-item card" @click="openItem(it)">
-            <div class="catch-up-chat">{{ it.row.title }}</div>
-            <div class="catch-up-from">{{ senderName(it.message) }} · {{ fmt(it.published) }}</div>
-            <div class="catch-up-preview">{{ preview(it.message) }}</div>
+      <ul v-show="!busy && !err" class="important-list catch-up-sidebar-list" role="list">
+        <li v-for="(it, i) in items" :key="it.message.url + '-' + i">
+          <button type="button" class="important-item catch-up-sidebar-item" @click="openItem(it)">
+            <div class="catch-up-sidebar-chat">{{ it.row.title }}</div>
+            <div class="catch-up-sidebar-meta">{{ senderName(it.message) }} · {{ fmt(it.published) }}</div>
+            <div class="imp-preview catch-up-sidebar-preview">{{ preview(it.message) }}</div>
           </button>
         </li>
-        <li v-if="!busy && items.length === 0" class="catch-up-empty">You’re all caught up — no unread messages.</li>
+        <li v-if="!busy && items.length === 0" class="empty-saved">You’re all caught up — no unread messages.</li>
       </ul>
     </div>
   </div>
@@ -1114,6 +1201,9 @@ const ExplorePageView = {
       this.previewErr = "";
       this.previewMessages = [];
       try {
+        if (!this.me) {
+          throw new Error("You need to be logged in to preview.");
+        }
         const rows = await drainDiscover([obj.value.channel], GRAFFITI_OBJECT_SCHEMA, this.me);
         const msgs = rows
           .filter((o) => o && o.value && o.value.activity === "Send")
@@ -1132,11 +1222,15 @@ const ExplorePageView = {
       }
     },
     closePreview() {
-      if (this.previewBusy) return;
+      // Always closable — don’t trap users if discovery hangs.
       this.previewOpen = false;
       this.previewErr = "";
       this.previewObj = null;
       this.previewMessages = [];
+      this.previewBusy = false;
+    },
+    fmtTime(ts) {
+      return formatTime(ts);
     },
     senderLine(msg) {
       const actor = (msg && msg.value && msg.value.actor) || (msg && msg.actor) || "";
@@ -1153,7 +1247,8 @@ const ExplorePageView = {
       const v = obj && obj.value;
       const ch = v && v.channel ? String(v.channel) : "";
       const ov = ch ? chatMetaOverrides.value.get(ch) : null;
-      return (ov && ov.folder) || (v && v.folder) || "";
+      const raw = (ov && ov.folder) || (v && v.folder) || "";
+      return raw || "Groups";
     },
     async joinFromPreview() {
       if (!this.previewObj || this.previewBusy) return;
@@ -1165,65 +1260,73 @@ const ExplorePageView = {
   <div class="explore-page explore-page-main main-page-full" aria-label="Explore people">
     <div class="main-page-inner card explore-main-card">
       <h1 class="page-title">Explore</h1>
-      <p class="page-lead">Search by <strong>username</strong> or name, start a private message, spin up a group, or join a public invite — same pink list you use everywhere.</p>
+      <p class="page-lead">Everyone with a saved profile appears below — filter by <strong>username</strong> or name. Start a private chat, create a group, or preview public invites.</p>
 
-      <label class="search-label">Search people</label>
+      <label class="search-label">Filter people (optional)</label>
       <input v-model="q" class="search-input" type="search" placeholder="Username, first name, or last name…" autocomplete="off" />
 
       <p v-if="err" class="error-msg" role="alert">{{ err }}</p>
       <p v-if="busy" class="inline-status">Loading directory…</p>
 
-      <ul v-else class="explore-results" role="list">
-        <li v-for="r in hits" :key="r.actor" class="explore-card card">
-          <div class="explore-card-av">
-            <graffiti-media-img v-if="photoFor(r.actor)" :src="photoFor(r.actor)" img-class="explore-av" alt="" />
-            <div v-else class="explore-av ph" aria-hidden="true">{{ (r.username || r.actor).charAt(0).toUpperCase() }}</div>
-          </div>
-          <div class="explore-card-body">
-            <div class="explore-line1">{{ fullName(r) }}</div>
-            <div class="explore-line2">@{{ (r.username || "unknown").replace(/^@/, "") }}</div>
-            <div class="explore-line-actor" title="Internal id (only if you need it)">{{ shortActor(r.actor) }}</div>
-          </div>
-          <div class="explore-card-actions">
-            <button type="button" class="btn btn-ghost" @click="goProfile(r.actor)">Profile</button>
-            <button type="button" class="btn btn-secondary" :disabled="!!directBusy" @click="startDirect(r)">
-              {{ directBusy === r.actor ? "Opening…" : "Message" }}
-            </button>
-          </div>
-        </li>
-        <li v-if="hits.length === 0 && !busy" class="explore-empty">No one matches that search yet, or the directory is still empty. When classmates save a public username on their profile, they show up here.</li>
-      </ul>
-
-      <div class="explore-actions explore-actions-main">
-        <button type="button" class="btn btn-primary" @click="startGroup">＋ New group</button>
-        <p class="explore-hint">Name the conversation and pick a folder. New groups default to <strong>Groups</strong> (and always show under <strong>All</strong>).</p>
+      <div v-else class="explore-section explore-section--people">
+        <div class="section-label">People</div>
+        <ul class="explore-results" role="list">
+          <li v-for="r in hits" :key="r.actor" class="explore-card card">
+            <div class="explore-card-av">
+              <graffiti-media-img v-if="photoFor(r.actor)" :src="photoFor(r.actor)" img-class="explore-av" alt="" />
+              <div v-else class="explore-av ph" aria-hidden="true">{{ (r.username || '?').charAt(0).toUpperCase() }}</div>
+            </div>
+            <div class="explore-card-body">
+              <div class="explore-line1">{{ fullName(r) }}</div>
+              <div class="explore-line2">@{{ (r.username || "unknown").replace(/^@/, "") }}</div>
+            </div>
+            <div class="explore-card-actions">
+              <button type="button" class="btn btn-ghost" @click="goProfile(r.actor)">Profile</button>
+              <button type="button" class="btn btn-secondary" :disabled="!!directBusy" @click="startDirect(r)">
+                {{ directBusy === r.actor ? "Opening…" : "Start chat" }}
+              </button>
+            </div>
+          </li>
+          <li v-if="hits.length === 0" class="explore-empty">
+            <template v-if="!String(q).trim()">No profiles in the directory yet. Ask classmates to save their profile — then they’ll appear here automatically.</template>
+            <template v-else>No matches for that filter.</template>
+          </li>
+        </ul>
       </div>
 
-      <div class="explore-discover">
-        <div class="section-label">Chats you can join</div>
+      <div class="explore-actions explore-actions-main">
+        <button type="button" class="btn btn-primary" @click="startGroup">＋ Create group</button>
+        <p class="explore-hint">Opens the group creator — pick a name and which sidebar folder it lives under.</p>
+      </div>
+
+      <div class="explore-discover explore-section explore-section--groups">
+        <div class="section-label">Public groups & invites</div>
         <p class="inline-status explore-discover-status">{{ dStatus }}</p>
-        <ul class="discover-list" role="list">
-          <li v-for="(obj, j) in availableJoins" :key="(obj.value && obj.value.id) || j" class="join-row">
-            <span>{{ joinTitle(obj) }} · {{ joinFolder(obj) }}</span>
+        <ul class="discover-list discover-list--cards" role="list">
+          <li v-for="(obj, j) in availableJoins" :key="(obj.value && obj.value.id) || j" class="join-row join-row--card">
+            <div class="join-row-main">
+              <span class="join-row-title">{{ joinTitle(obj) }}</span>
+              <span class="join-row-folder">{{ joinFolder(obj) }}</span>
+            </div>
             <div class="join-row-actions">
               <button type="button" class="btn btn-ghost btn-tiny" :disabled="joining" @click="openPreview(obj)">Preview</button>
               <button type="button" class="btn btn-secondary btn-tiny" :disabled="joining" @click="doJoin(obj)">Join</button>
             </div>
           </li>
-          <li v-if="availableJoins.length === 0" class="discover-list-empty">No new public invites, or you already joined them all.</li>
+          <li v-if="availableJoins.length === 0" class="discover-list-empty">No public invites right now, or you already joined them.</li>
         </ul>
       </div>
 
       <div v-show="previewOpen" class="modal" role="dialog" aria-modal="true" aria-labelledby="join-preview-title">
         <div class="modal-backdrop" @click="closePreview"></div>
         <div class="modal-content card modal-narrow" @click.stop>
-          <h2 id="join-preview-title">Preview before joining</h2>
-          <p class="modal-chat-name">{{ joinTitle(previewObj) }}</p>
+          <h2 id="join-preview-title">Preview group</h2>
+          <p class="modal-chat-name">{{ previewObj ? joinTitle(previewObj) : '' }}</p>
           <p v-if="previewBusy" class="inline-status">Loading preview…</p>
           <p v-if="previewErr" class="error-msg" role="alert">{{ previewErr }}</p>
           <ul v-if="!previewBusy && !previewErr" class="preview-msg-list">
             <li v-for="m in previewMessages" :key="m.url" class="preview-msg-item">
-              <div class="preview-msg-meta">{{ senderLine(m) }} · {{ formatTime(m.value && m.value.published) }}</div>
+              <div class="preview-msg-meta">{{ senderLine(m) }} · {{ fmtTime(m.value && m.value.published) }}</div>
               <div class="preview-msg-body">{{ (m.value && m.value.content) || "(no text)" }}</div>
             </li>
             <li v-if="previewMessages.length === 0" class="discover-list-empty">No messages yet in this chat.</li>
@@ -1317,7 +1420,6 @@ const ChatView = {
         this.chatSwitchLoading = true;
       }
       this.loadBusy = true;
-      globalStatus.value = "Loading chat…";
       try {
         if (!this.sess) return;
         await loadImportantMarkers();
@@ -1345,7 +1447,6 @@ const ChatView = {
       } finally {
         this.loadBusy = false;
         this.chatSwitchLoading = false;
-        globalStatus.value = "";
       }
     },
     /** One-shot pop-in: clear after the bounce CSS finishes so re-renders don’t replay. */
@@ -1387,7 +1488,8 @@ const ChatView = {
     },
     onComposerKeydown(e) {
       if (e.key !== "Enter") return;
-      if (e.shiftKey) return; // new line
+      // New line: Shift+Enter, Ctrl+Enter, or Cmd+Enter — common patterns across chat apps.
+      if (e.shiftKey || e.ctrlKey || e.metaKey) return;
       e.preventDefault();
       this.onSend();
     },
@@ -1399,7 +1501,6 @@ const ChatView = {
       if (!r) return;
       this.sendBusy = true;
       this.err = "";
-      globalStatus.value = "Sending…";
       const msgId = crypto.randomUUID();
       const published = Date.now();
       // Optimistic row: bounce can start before Graffiti returns (same id → smooth handoff to real object).
@@ -1461,7 +1562,6 @@ const ChatView = {
         this.err = "Send failed: " + e.message;
       } finally {
         this.sendBusy = false;
-        globalStatus.value = "";
       }
     },
     async onToggleImportant(o) {
@@ -1469,7 +1569,6 @@ const ChatView = {
       this.impBusy = true;
       this.err = "";
       const ex = importantByMessageUrl.value.get(o.url);
-      globalStatus.value = ex ? "Updating saved…" : "Saving…";
       try {
         if (ex) {
           await graffiti.delete(ex.importantUrl, this.sess);
@@ -1506,7 +1605,6 @@ const ChatView = {
         this.err = "Could not update saved: " + e.message;
       } finally {
         this.impBusy = false;
-        globalStatus.value = "";
       }
     },
     goProfile(actor) {
@@ -1577,7 +1675,7 @@ const ChatView = {
           class="message-input"
           ref="ta"
           rows="2"
-          placeholder="Type a message… (Enter to send, Shift+Enter for a new line)"
+          placeholder="Type a message… (Enter sends · Shift+Enter or Ctrl+Enter for a new line)"
           maxlength="4000"
           @keydown="onComposerKeydown"
         ></textarea>
@@ -1652,7 +1750,7 @@ const ImportantView = {
         );
         this.status = "";
       } catch (e) {
-        this.status = "Could not load your important list.";
+        this.status = "Could not load saved messages.";
         console.error(e);
       }
     },
@@ -1663,7 +1761,7 @@ const ImportantView = {
         params: { chatId: routeIdFromChannel(v.chatChannel) },
         query: {
           highlight: v.target || undefined,
-          from: "important",
+          from: "saved",
         },
       });
     },
@@ -1680,10 +1778,10 @@ const ImportantView = {
     },
   },
   template: `
-  <div class="sidebar-embed important-page" aria-label="Important messages">
+  <div class="sidebar-embed important-page" aria-label="Saved messages">
     <div class="sidebar-embed-scroll important-inner">
-      <h1 class="page-title">Important</h1>
-      <p class="page-lead">Starred lines you marked. Tap a row to open that conversation in the main area.</p>
+      <h1 class="page-title">Saved messages</h1>
+      <p class="page-lead">Messages you saved from chats — tap a row to jump back to that conversation with this line highlighted.</p>
       <p class="inline-status">{{ status }}</p>
       <ul class="important-list" v-show="status === ''" role="list">
         <li v-for="(o, i) in items" :key="(o.value && o.value.id) || o.url + i">
@@ -1692,7 +1790,7 @@ const ImportantView = {
             <div class="imp-meta">{{ o.value.chatTitle || "Chat" }} · {{ fmt(o.value.published) }}{{ senderLine(o.value) }}</div>
           </button>
         </li>
-        <li v-if="items.length===0" class="empty-saved">Nothing in Important yet. In a chat, tap the star on a message to add it here.</li>
+        <li v-if="items.length===0" class="empty-saved">Nothing saved yet. In any chat, press <strong>Save</strong> on a message to park it here.</li>
       </ul>
     </div>
   </div>
@@ -1773,7 +1871,7 @@ const ProfileView = {
         <div class="profile-text-block">
           <p v-if="p && p.username && (p.firstName || p.lastName)" class="profile-handle">@{{ (p.username || "").replace(/^@/, "") }}</p>
           <h2 class="profile-name">{{ nameLine || "Name not set" }}</h2>
-          <p class="profile-actor">Account id: <code>{{ actor }}</code></p>
+          <p class="profile-actor-muted">Technical account id (debugging): <code>{{ actor }}</code></p>
         </div>
       </div>
       <p v-else class="empty-profile">No public profile here yet. They can add one in Pink Messages (username + name) from Edit profile.</p>
@@ -1993,7 +2091,7 @@ const MainEmptyView = {
   template: `
   <div class="main-page-full main-messages-placeholder">
     <div class="placeholder main-page-inner">
-      <p><strong>Messages</strong> show here when you open a chat. <strong>Important</strong> uses the <strong>left column</strong> for saved items. Open <strong>Explore</strong> for search and new groups, or <strong>Chats</strong> to pick a room.</p>
+      <p><strong>Chats</strong> open in this area. Use the <strong>left column</strong> for <strong>Saved</strong> messages or <strong>Catch Up</strong> unread items while you read or reply.</p>
     </div>
   </div>
   `,
@@ -2002,7 +2100,7 @@ const MainEmptyView = {
 // -- shell: side bar + where the child route draws
 const MainLayout = {
   name: "MainLayout",
-  components: { ImportantView },
+  components: { ImportantView, GraffitiMediaImg, CatchUpView },
   inject: ["getSession", "onRouter"],
   provide() {
     // Explore “New group” opens the modal with Groups as the default folder
@@ -2017,7 +2115,7 @@ const MainLayout = {
       selectedFolder: "All",
       modalOpen: false,
       newTitle: "",
-      newFolder: "People",
+      newFolder: "Groups",
       newStatus: "",
       newErr: "",
       creating: false,
@@ -2030,11 +2128,41 @@ const MainLayout = {
       editFolder: "Groups",
       editBusy: false,
       editErr: "",
+      /** Which chat row’s ⋯ menu is open (channel id) */
+      chatActionsOpen: null,
+      /** Extra folder names — stored in localStorage per actor (see loadCustomFolderNames). */
+      customFolders: [],
+      newFolderLabel: "",
+      folderUiErr: "",
+      /** True while moving chats out of a folder being deleted */
+      folderReassignBusy: false,
     };
   },
   computed: {
     session() {
       return this.getSession();
+    },
+    /** True when user opened a thread from Catch Up (sidebar list stays visible). */
+    openedChatFromCatchUp() {
+      return String(this.$route.query.from || "") === "catchup";
+    },
+    /** True when user opened a thread from the Saved sidebar (accept legacy ?from=important links). */
+    openedChatFromSaved() {
+      const q = String(this.$route.query.from || "");
+      return q === "saved" || q === "important";
+    },
+    meProfile() {
+      const s = this.session;
+      if (!s) return null;
+      return profileCache[s.actor] != null ? profileCache[s.actor] : null;
+    },
+    headerAvatarSrc() {
+      return profileImageSrc(this.meProfile);
+    },
+    headerAvatarLetter() {
+      const h = this.handle || "";
+      if (h.startsWith("@")) return h.charAt(1).toUpperCase() || "?";
+      return h.charAt(0).toUpperCase() || "?";
     },
     handle() {
       return userHandle.value;
@@ -2060,6 +2188,12 @@ const MainLayout = {
         return r.folder === this.selectedFolder;
       });
     },
+    filteredPinned() {
+      return this.filtered.filter((r) => r.pinned);
+    },
+    filteredRest() {
+      return this.filtered.filter((r) => !r.pinned);
+    },
     availableJoins() {
       const joined = new Set(this.rows.map((r) => r.channel));
       return this.creates.filter((c) => c.value && !deletedChatChannels.value.has(String(c.value.channel || "")) && (c.value.chatKind || "group") !== "direct" && !joined.has(c.value.channel));
@@ -2067,14 +2201,15 @@ const MainLayout = {
     chatsTabActive() {
       const n = this.$route.name;
       if (n === "catchUp") return false;
-      const fromImp = String(this.$route.query.from || "") === "important";
-      // “Chats” tab = normal list + chat only when we didn’t open the thread from Important
+      // “Chats” tab = list + chat except when thread was opened from Saved or Catch Up sidebars
       if (n === "home") return true;
-      if (n === "chat" && !fromImp) return true;
+      if (n === "chat" && !this.openedChatFromSaved && !this.openedChatFromCatchUp) return true;
       return false;
     },
     catchUpTabActive() {
-      return this.$route.name === "catchUp";
+      if (this.$route.name === "catchUp") return true;
+      if (this.$route.name === "chat" && this.openedChatFromCatchUp) return true;
+      return false;
     },
     /** Total unread across all sidebar chats (for Catch Up entry badge). */
     catchUpTotalUnread() {
@@ -2085,27 +2220,136 @@ const MainLayout = {
     exploreTabActive() {
       return this.$route.name === "explore";
     },
+    // Catch Up list in the left column (route /catch-up, or chat opened with ?from=catchup)
+    showCatchUpSidebar() {
+      const n = this.$route.name;
+      if (n === "catchUp") return true;
+      if (n === "chat" && this.openedChatFromCatchUp) return true;
+      return false;
+    },
     // Keep the Important list in the left column even while a chat is open in the main area
     showImportantSidebar() {
       const n = this.$route.name;
       if (n === "important") return true;
-      if (n === "chat" && String(this.$route.query.from || "") === "important") return true;
+      if (n === "chat" && this.openedChatFromSaved) return true;
       return false;
     },
     importantTabActive() {
       return this.showImportantSidebar;
     },
+    /** Group folder on server not in our sidebar list — still show in edit dropdown */
+    orphanEditFolder() {
+      const row = this.chatConfirm && this.chatConfirm.row;
+      if (!row || row.chatKind !== "group") return "";
+      const f = String(row.folder || "").trim();
+      if (!f || f === "People" || f === "Groups") return "";
+      if (this.customFolders.includes(f)) return "";
+      return f;
+    },
+  },
+  watch: {
+    session: {
+      handler(s) {
+        if (s && s.actor) {
+          this.customFolders = loadCustomFolderNames(s.actor);
+        } else {
+          this.customFolders = [];
+        }
+        const sel = this.selectedFolder;
+        const ok =
+          sel === "All" ||
+          sel === "People" ||
+          sel === "Groups" ||
+          (Array.isArray(this.customFolders) && this.customFolders.includes(sel));
+        if (!ok) this.selectedFolder = "All";
+      },
+      immediate: true,
+    },
+  },
+  mounted() {
+    document.addEventListener("click", this.closeChatMenusIfOutside);
+  },
+  beforeUnmount() {
+    document.removeEventListener("click", this.closeChatMenusIfOutside);
   },
   methods: {
+    closeChatMenusIfOutside() {
+      this.chatActionsOpen = null;
+    },
+    toggleChatMenu(r) {
+      const ch = r && r.channel;
+      if (!ch) return;
+      this.chatActionsOpen = this.chatActionsOpen === ch ? null : ch;
+    },
+    menuPin(r) {
+      this.chatActionsOpen = null;
+      this.onTogglePin(r);
+    },
+    menuRemoveChat(r) {
+      this.chatActionsOpen = null;
+      this.askRemoveChat(r);
+    },
+    canManageChatRow(row) {
+      return !!(row && (row.joinUrl || (row.source === "create" && row.createUrl)));
+    },
+    chatRemoveMenuLabel(row) {
+      if (!row) return "Remove…";
+      if (row.chatKind === "direct") return "Remove from my list…";
+      return "Leave or manage group…";
+    },
     setFolder(f) {
       this.selectedFolder = f;
+    },
+    addCustomFolder() {
+      this.folderUiErr = "";
+      const raw = String(this.newFolderLabel || "").trim().slice(0, 40);
+      if (!raw) {
+        this.folderUiErr = "Enter a folder name.";
+        return;
+      }
+      const low = raw.toLowerCase();
+      if (RESERVED_FOLDER_NAMES.has(low)) {
+        this.folderUiErr = "That name is reserved.";
+        return;
+      }
+      if (this.customFolders.some((x) => String(x).toLowerCase() === low)) {
+        this.folderUiErr = "You already have a folder with that name.";
+        return;
+      }
+      this.customFolders = [...this.customFolders, raw];
+      this.newFolderLabel = "";
+      const s = this.session;
+      if (s && s.actor) saveCustomFolderNames(s.actor, this.customFolders);
+    },
+    async removeCustomFolder(name) {
+      if (this.folderReassignBusy) return;
+      this.folderUiErr = "";
+      const s = this.session;
+      if (!s || !name) return;
+      const ok = window.confirm(
+        `Delete folder "${name}"? Chats in this folder will be moved to Groups (direct chats to People).`,
+      );
+      if (!ok) return;
+      this.folderReassignBusy = true;
+      globalStatus.value = "Moving chats to Groups…";
+      try {
+        await reassignChatsFromDeletedFolder(toRaw(s), name);
+        this.customFolders = this.customFolders.filter((x) => x !== name);
+        if (this.selectedFolder === name) this.selectedFolder = "All";
+        saveCustomFolderNames(s.actor, this.customFolders);
+      } catch (e) {
+        this.folderUiErr = (e && e.message) || String(e);
+      } finally {
+        this.folderReassignBusy = false;
+        globalStatus.value = "";
+      }
     },
     openNew(opts = {}) {
       this.modalOpen = true;
       this.newTitle = "";
       this.newErr = "";
       this.newStatus = "";
-      this.newFolder = opts.defaultFolder != null ? opts.defaultFolder : "People";
+      this.newFolder = opts.defaultFolder != null ? opts.defaultFolder : "Groups";
     },
     closeNew() {
       this.modalOpen = false;
@@ -2239,13 +2483,21 @@ const MainLayout = {
       const s = this.session;
       if (!s) return;
       this.listRemoveErr = "";
-      globalStatus.value = row.pinned ? "Unpinning…" : "Pinning…";
+      const next = !row.pinned;
+      const snapshot = chatRows.value.map((r) => ({ ...r }));
+      chatRows.value = sortChatRowsByPinThenTitle(
+        chatRows.value.map((r) => (r.channel === row.channel ? { ...r, pinned: next } : r))
+      );
       try {
-        await togglePinChat(s, row);
+        await persistPinChat(toRaw(s), row, next);
+        const ps = pinStateByChannel.value.get(row.channel);
+        const pinned = !!(ps && ps.pinned);
+        chatRows.value = sortChatRowsByPinThenTitle(
+          chatRows.value.map((r) => (r.channel === row.channel ? { ...r, pinned } : r))
+        );
       } catch (e) {
+        chatRows.value = sortChatRowsByPinThenTitle(snapshot.map((r) => ({ ...r })));
         this.listRemoveErr = (e && e.message) || String(e);
-      } finally {
-        globalStatus.value = "";
       }
     },
   },
@@ -2257,13 +2509,23 @@ const MainLayout = {
         <router-link to="/" class="header-link header-title">Pink Messages</router-link>
       </div>
       <div class="header-right">
-        <span class="user-handle">{{ handle }}</span>
-        <router-link to="/profile/edit" class="btn btn-secondary btn-tiny" active-class="router-link-active">My profile</router-link>
+        <router-link
+          v-if="session"
+          :to="{ name: 'profile', params: { actor: session.actor } }"
+          class="header-account-chip"
+          title="Your public profile"
+        >
+          <graffiti-media-img v-if="headerAvatarSrc" :src="headerAvatarSrc" img-class="header-account-avatar" alt="" />
+          <div v-else class="header-account-avatar ph" aria-hidden="true">{{ headerAvatarLetter }}</div>
+          <span class="header-account-handle">{{ handle }}</span>
+        </router-link>
+        <router-link to="/profile/edit" class="btn btn-secondary btn-tiny" active-class="router-link-active">Edit profile</router-link>
         <button type="button" class="btn btn-ghost" @click="logout">Log out</button>
       </div>
     </header>
 
     <nav class="tab-bar" role="tablist" aria-label="Main">
+      <div class="tab-bar-inner">
       <!--
         Custom slot: a link to to="/" would otherwise get router-link-active on every
         child route (explore, important, …). We only add .active via chatsTabActive.
@@ -2293,7 +2555,8 @@ const MainLayout = {
         class="tab"
         :class="{ active: importantTabActive }"
         active-class="active"
-      >Important</router-link>
+      >Saved</router-link>
+      </div>
     </nav>
 
     <p class="global-status">{{ gStatus }}</p>
@@ -2302,6 +2565,7 @@ const MainLayout = {
       <div class="chats-layout">
         <aside class="sidebar card">
           <important-view v-if="showImportantSidebar" key="im" />
+          <catch-up-view v-else-if="showCatchUpSidebar" key="cu" />
           <template v-else>
             <div class="sidebar-section">
               <div class="section-label">Folders</div>
@@ -2309,8 +2573,38 @@ const MainLayout = {
                 <button type="button" class="folder-pill" :class="{ active: selectedFolder==='All' }" @click="setFolder('All')">All</button>
                 <button type="button" class="folder-pill" :class="{ active: selectedFolder==='People' }" @click="setFolder('People')">People</button>
                 <button type="button" class="folder-pill" :class="{ active: selectedFolder==='Groups' }" @click="setFolder('Groups')">Groups</button>
-                <button type="button" class="folder-pill" :class="{ active: selectedFolder==='Verification' }" @click="setFolder('Verification')">Verification</button>
+                <button
+                  v-for="name in customFolders"
+                  :key="'folder-' + name"
+                  type="button"
+                  class="folder-pill folder-pill--custom"
+                  :class="{ active: selectedFolder === name }"
+                  @click="setFolder(name)"
+                >
+                  <span class="folder-pill-label">{{ name }}</span>
+                  <span
+                    class="folder-pill-remove"
+                    role="button"
+                    tabindex="0"
+                    title="Remove this folder name from your list"
+                    @click.stop="removeCustomFolder(name)"
+                  >×</span>
+                </button>
               </div>
+              <div class="folder-custom-add">
+                <label class="sr-only" for="sidebar-new-folder">New folder name</label>
+                <input
+                  id="sidebar-new-folder"
+                  v-model="newFolderLabel"
+                  class="folder-custom-input"
+                  type="text"
+                  maxlength="40"
+                  placeholder="Add folder…"
+                  @keydown.enter.prevent="addCustomFolder"
+                />
+                <button type="button" class="btn btn-secondary btn-tiny" @click="addCustomFolder">Add</button>
+              </div>
+              <p v-if="folderUiErr" class="error-msg folder-custom-err">{{ folderUiErr }}</p>
             </div>
 
             <div class="sidebar-section sidebar-catch-up">
@@ -2329,15 +2623,66 @@ const MainLayout = {
               <div class="section-label">Your chats</div>
               <p v-if="listRemoveErr" class="error-msg" role="alert">{{ listRemoveErr }}</p>
               <p class="inline-status">{{ listStatus }}</p>
-              <ul class="chat-list">
-                <li v-for="r in filtered" :key="r.channel" class="chat-list-item">
+
+              <template v-if="filteredPinned.length">
+                <div class="sidebar-micro-label">Pinned</div>
+                <ul class="chat-list chat-list--pinned-section">
+                  <li v-for="r in filteredPinned" :key="'pin-' + r.channel" class="chat-list-item chat-list-item--pinned">
+                    <router-link
+                      :to="{ name: 'chat', params: { chatId: channelToRouteId(r.channel) } }"
+                      class="chat-item"
+                      active-class="selected"
+                    >
+                      <span class="chat-item-title-row">
+                        <span class="chat-pin-marker" title="Pinned">📌</span>
+                        <span class="chat-item-title">{{ r.title }}</span>
+                      </span>
+                      <span class="chat-item-meta-row">
+                        <span class="chat-item-meta">{{ r.folder }}</span>
+                        <span v-if="unreadFor(r.channel) > 0" class="chat-unread-badge" aria-label="Unread messages">{{
+                          unreadFor(r.channel) > 99 ? '99+' : unreadFor(r.channel)
+                        }}</span>
+                      </span>
+                    </router-link>
+                    <div class="chat-actions-wrap">
+                      <button
+                        type="button"
+                        class="btn-chat-more"
+                        aria-haspopup="true"
+                        :aria-expanded="chatActionsOpen === r.channel"
+                        :disabled="removeBusy"
+                        @click.stop="toggleChatMenu(r)"
+                      >⋯</button>
+                      <div
+                        v-if="chatActionsOpen === r.channel"
+                        class="chat-actions-menu"
+                        role="menu"
+                        @click.stop
+                      >
+                        <button type="button" class="chat-actions-menu-item" role="menuitem" @click="menuPin(r)">Unpin chat</button>
+                        <button
+                          v-if="canManageChatRow(r)"
+                          type="button"
+                          class="chat-actions-menu-item chat-actions-menu-item--danger"
+                          role="menuitem"
+                          @click="menuRemoveChat(r)"
+                        >{{ chatRemoveMenuLabel(r) }}</button>
+                      </div>
+                    </div>
+                  </li>
+                </ul>
+              </template>
+
+              <div v-if="filteredPinned.length && filteredRest.length" class="sidebar-micro-label sidebar-micro-label--spaced">More chats</div>
+
+              <ul v-if="filteredRest.length" class="chat-list" :class="{ 'chat-list--after-pinned': filteredPinned.length }">
+                <li v-for="r in filteredRest" :key="r.channel" class="chat-list-item">
                   <router-link
                     :to="{ name: 'chat', params: { chatId: channelToRouteId(r.channel) } }"
                     class="chat-item"
                     active-class="selected"
                   >
                     <span class="chat-item-title-row">
-                      <span v-if="r.pinned" class="chat-pin-marker" title="Pinned">📌</span>
                       <span class="chat-item-title">{{ r.title }}</span>
                     </span>
                     <span class="chat-item-meta-row">
@@ -2347,28 +2692,34 @@ const MainLayout = {
                       }}</span>
                     </span>
                   </router-link>
-                  <div class="chat-row-pin">
-                    <button
-                      type="button"
-                      class="btn-pin"
-                      :title="r.pinned ? 'Unpin chat' : 'Pin chat'"
-                      :disabled="removeBusy"
-                      @click.prevent="onTogglePin(r)"
-                    >
-                      <span class="btn-pin-glyph" aria-hidden="true">{{ r.pinned ? '📌' : '📍' }}</span>
-                    </button>
-                  </div>
-                  <div class="chat-row-more" v-if="r.joinUrl || (r.source === 'create' && r.createUrl)">
+                  <div class="chat-actions-wrap">
                     <button
                       type="button"
                       class="btn-chat-more"
-                      :title="r.chatKind === 'direct' ? 'Remove this chat from your list' : (r.createActor === session.actor ? 'Group actions (edit, leave, or delete for everyone)' : 'Leave this group')"
+                      aria-haspopup="true"
+                      :aria-expanded="chatActionsOpen === r.channel"
                       :disabled="removeBusy"
-                      @click.prevent="askRemoveChat(r)"
+                      @click.stop="toggleChatMenu(r)"
                     >⋯</button>
+                    <div
+                      v-if="chatActionsOpen === r.channel"
+                      class="chat-actions-menu"
+                      role="menu"
+                      @click.stop
+                    >
+                      <button type="button" class="chat-actions-menu-item" role="menuitem" @click="menuPin(r)">Pin chat</button>
+                      <button
+                        v-if="canManageChatRow(r)"
+                        type="button"
+                        class="chat-actions-menu-item chat-actions-menu-item--danger"
+                        role="menuitem"
+                        @click="menuRemoveChat(r)"
+                      >{{ chatRemoveMenuLabel(r) }}</button>
+                    </div>
                   </div>
                 </li>
               </ul>
+
               <p v-if="!listStatus && filtered.length===0" class="inline-status">No chats in this folder. Use <strong>Explore</strong> to find people or start a new chat.</p>
             </div>
           </template>
@@ -2383,18 +2734,19 @@ const MainLayout = {
     <div v-show="modalOpen" id="modal-new-chat" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-new-title">
       <div class="modal-backdrop" @click="closeNew"></div>
       <div class="modal-content card" @click.stop>
-        <h2 id="modal-new-title">New chat</h2>
+        <h2 id="modal-new-title">Create a group</h2>
+        <p class="modal-lead">Named groups live in your sidebar under the folder you choose. For a private 1:1, use <strong>Explore</strong> → <strong>Start chat</strong>.</p>
         <form @submit.prevent="createChat">
           <label>
-            Name
-            <input v-model="newTitle" type="text" required maxlength="120" placeholder="e.g. 6.4500 study" />
+            Group name
+            <input v-model="newTitle" type="text" required maxlength="120" placeholder="e.g. 6.4500 study group" />
           </label>
           <label>
-            Folder
+            Sidebar folder
             <select v-model="newFolder" required>
-              <option value="People">People</option>
               <option value="Groups">Groups</option>
-              <option value="Verification">Verification</option>
+              <option value="People">People</option>
+              <option v-for="n in customFolders" :key="'nf-' + n" :value="n">{{ n }}</option>
             </select>
           </label>
           <p class="inline-status">{{ newStatus }}</p>
@@ -2426,7 +2778,8 @@ const MainLayout = {
             <select v-model="editFolder" :disabled="chatConfirm.row.chatKind === 'direct'">
               <option value="People">People</option>
               <option value="Groups">Groups</option>
-              <option value="Verification">Verification</option>
+              <option v-for="n in customFolders" :key="'ef-' + n" :value="n">{{ n }}</option>
+              <option v-if="orphanEditFolder" :value="orphanEditFolder">{{ orphanEditFolder }}</option>
             </select>
           </label>
           <p v-if="chatConfirm.row.chatKind === 'direct'" class="field-hint">Direct chats stay in <strong>People</strong>.</p>
@@ -2504,7 +2857,7 @@ const Root = {
     <div v-show="!session" id="login-screen" class="screen">
       <div class="login-card card">
         <h1 class="app-title">Pink Messages</h1>
-        <p class="login-blurb">A small pastel chat powered by Graffiti, now with a tiny router. Log in, pick a room, and star things you need later.</p>
+        <p class="login-blurb">A small pastel chat powered by Graffiti — organize chats in folders, save messages for later, and catch up when you’re back.</p>
         <button type="button" class="btn btn-primary" @click="onLogin">Log in with Graffiti</button>
         <p class="inline-status" aria-live="polite">{{ loginMsg }}</p>
       </div>
@@ -2521,10 +2874,10 @@ const routes = [
     component: MainLayout,
     children: [
       { path: "", name: "home", component: HomeView, meta: { title: "Home" } },
-      { path: "catch-up", name: "catchUp", component: CatchUpView, meta: { title: "Catch Up" } },
+      { path: "catch-up", name: "catchUp", component: MainEmptyView, meta: { title: "Catch Up" } },
       { path: "chat/:chatId", name: "chat", component: ChatView, props: true, meta: { title: "Chat" } },
       { path: "explore", name: "explore", component: ExplorePageView, meta: { title: "Explore" } },
-      { path: "important", name: "important", component: MainEmptyView, meta: { title: "Important" } },
+      { path: "important", name: "important", component: MainEmptyView, meta: { title: "Saved" } },
       { path: "profile/edit", name: "profileEdit", component: ProfileEditView, meta: { title: "Edit profile" } },
       { path: "profile/:actor", name: "profile", component: ProfileView, props: true, meta: { title: "Profile" } },
     ],
