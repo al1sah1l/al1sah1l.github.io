@@ -958,10 +958,47 @@ function invalidateProfileCache(actor) {
 
 async function ensureProfiles(actors) {
   const u = [...new Set(actors || [])].filter(Boolean);
+  const indexRows = profileIndexRows.value || [];
   for (const a of u) {
     if (!(a in profileCache)) {
       // eslint-disable-next-line no-await-in-loop
       await loadProfileForActor(a);
+    }
+    // Personal SetProfile channel can be slow or opaque to this viewer; Explore uses ProfileIndex on a shared channel.
+    if (publicDisplayLine(profileCache[a] || null) !== "Someone") {
+      continue;
+    }
+    const idx = indexRows.find((r) => r && r.actor === a);
+    if (idx && (idx.username || idx.firstName || idx.lastName)) {
+      profileCache[a] = {
+        activity: "SetProfile",
+        actor: a,
+        username: String(idx.username || "")
+          .replace(/^@/, "")
+          .trim(),
+        firstName: idx.firstName || "",
+        lastName: idx.lastName || "",
+        updated: idx.updated || 0,
+      };
+      continue;
+    }
+    if (!session.value) continue;
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const h = await graffiti.actorToHandle(a);
+      const hs = h != null ? String(h).trim().replace(/^@/, "") : "";
+      if (hs) {
+        profileCache[a] = {
+          activity: "SetProfile",
+          actor: a,
+          username: hs,
+          firstName: "",
+          lastName: "",
+          updated: Date.now(),
+        };
+      }
+    } catch {
+      /* leave as Someone */
     }
   }
 }
@@ -970,10 +1007,10 @@ async function loadEverything() {
   if (!session.value) return;
   try {
     chatListStatus.value = "Loading chats…";
+    await refreshProfileIndexList();
     await buildChatRows();
     await loadImportantMarkers();
     importantTick.value++;
-    await refreshProfileIndexList();
     chatListStatus.value = "";
   } catch (e) {
     console.error(e);
